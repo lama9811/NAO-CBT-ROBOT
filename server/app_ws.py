@@ -2184,8 +2184,13 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
                 decision="cache_hit", reason=reason,
             )
 
+    # Silence never reaches here: the `no_voice` and `silero_no_speech` gates
+    # above already returned. So when Silero ran and confirmed speech, tell the
+    # filter -- otherwise its length backstop swallows one-word turns like a
+    # bare first name ("Mia") and NAO answers nothing at all.
     reason = legacy.transcript_reject_reason(
         sess.username, transcript, asking_name=sess.asking_name,
+        had_speech=bool(turn_silero_available and turn_had_speech),
     )
     if reason:
         logger.info(

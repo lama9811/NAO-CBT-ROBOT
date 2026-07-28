@@ -249,6 +249,7 @@ start_robot() {
     nao_ssh "nao@$NAO_IP" "PYTHONPATH=/opt/aldebaran/lib/python2.7/site-packages \
 LD_LIBRARY_PATH=/opt/aldebaran/lib:/opt/aldebaran/lib/naoqi \
 SERVER_IP='$LOCAL_IP' SERVER_PORT='$SERVER_BIND_PORT' \
+NAO_IP='127.0.0.1' NAO_PORT='${NAO_PORT:-9559}' \
 USE_WS='$USE_WS' \
 NAO_SHARED_SECRET='$NAO_SHARED_SECRET' \
 IMAGE_PER_TURN='${IMAGE_PER_TURN:-1}' \
