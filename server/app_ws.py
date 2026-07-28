@@ -2184,8 +2184,13 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
                 decision="cache_hit", reason=reason,
             )
 
+    # Silence never reaches here: the `no_voice` and `silero_no_speech` gates
+    # above already returned. So when Silero ran and confirmed speech, tell the
+    # filter -- otherwise its length backstop swallows one-word turns like a
+    # bare first name ("Mia") and NAO answers nothing at all.
     reason = legacy.transcript_reject_reason(
         sess.username, transcript, asking_name=sess.asking_name,
+        had_speech=bool(turn_silero_available and turn_had_speech),
     )
     if reason:
         logger.info(
@@ -2952,7 +2957,8 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         # doesn't include Scribe (gated on USE_ELEVENLABS_STT).
         try:
             from server import elevenlabs_stt as _el_stt
-            if _el_stt.is_available():
+            if (getattr(config, "USE_ELEVENLABS_STT_REALTIME", False)
+                    and _el_stt.is_available()):
                 stt_sess = _el_stt.StreamingSttSession()
                 ok = await stt_sess.open(sample_rate=16000, language="en")
                 if ok:
