@@ -446,6 +446,20 @@ def transcribe(path: str) -> str:
             return text
         print("[transcribe] deepgram returned empty; falling back to whisper",
               flush=True)
+    if getattr(config, "USE_ELEVENLABS_STT", False):
+        # Batch REST, not the realtime WS -- keys without the realtime
+        # entitlement 403 on the handshake.
+        from server import elevenlabs_stt
+        text, non_english = elevenlabs_stt.transcribe_rest_detailed(path)
+        if text:
+            return text
+        if non_english:
+            # Scribe is confident this was not English. Whisper would happily
+            # hand the same foreign text back (it ignores our language="en"
+            # hint), so stop here and let the empty transcript be rejected.
+            return ""
+        print("[transcribe] elevenlabs returned empty; falling back to whisper",
+              flush=True)
     with open(path, "rb") as f:
         resp = _client.audio.transcriptions.create(
             model=config.WHISPER_MODEL, file=f,

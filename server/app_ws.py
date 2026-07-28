@@ -2957,7 +2957,8 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         # doesn't include Scribe (gated on USE_ELEVENLABS_STT).
         try:
             from server import elevenlabs_stt as _el_stt
-            if _el_stt.is_available():
+            if (getattr(config, "USE_ELEVENLABS_STT_REALTIME", False)
+                    and _el_stt.is_available()):
                 stt_sess = _el_stt.StreamingSttSession()
                 ok = await stt_sess.open(sample_rate=16000, language="en")
                 if ok:
