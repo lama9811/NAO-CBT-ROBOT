@@ -11,7 +11,7 @@ NAO humanoid robot assistant for Morgan State University, built on the **OpenAI 
 | **Ears** | ElevenLabs | Scribe `scribe_v1` via REST, falls back to OpenAI `gpt-4o-transcribe` |
 | **Brain** | Anthropic | Sonnet 5 for conversation lanes, Haiku 4.5 for router/skills/action |
 | **Voice** | ElevenLabs | `eleven_flash_v2_5`, falls back to OpenAI `tts-1` |
-| **Safety + CBT tools + vision** | OpenAI | `CRISIS_MODEL` / `VISION_MODEL` — the remaining OpenAI holdouts |
+| **Safety + CBT tools + vision** | *configurable* | `CRISIS_MODEL` / `VISION_MODEL` — OpenAI by code default, but the live Mac + Pi `.env` now point them at Claude (`claude-opus-5` / `claude-sonnet-5`) as of 2026-07-29 |
 
 `OPENAI_API_KEY` is still **mandatory**: `config.py:17` reads it with
 `os.environ[...]`, so a missing key is a `KeyError` at import and the server
@@ -186,28 +186,56 @@ The Pi is the always-on brain so the robot works with nobody's laptop around
 
 - **Robot code** reaches the robot by **rsync** (`./run.sh`) — never git.
 - **Server code** reaches the Pi by **git push → Pi `git pull`** — never rsync.
+  The Pi's `origin` is **`github.com/lama9811/nao-sagecbt`** (repointed from a
+  collaborator's fork `theaayushstha1/...` on 2026-07-29; that fork's `main` was
+  stale). It tracks `main`, so push to `main` (`git push origin HEAD:main`) then
+  `ssh naoserver 'cd ~/nao-sagecbt && git pull && sudo systemctl restart nao-server'`.
 - **`.env` reaches the Pi by neither.** It is gitignored, so every key and model
   setting must be recreated there by hand. A Pi that pulled fine but behaves
-  like an older build is almost always an out-of-date `.env`.
+  like an older build is almost always an out-of-date `.env`. As of 2026-07-29
+  the Pi's `.env` was reconciled to Mac parity and **runs the Claude stack**
+  (see below). Deliberately NOT synced: `NAO_SHARED_SECRET` (kept the Pi's — it
+  pairs with the robot), `FFMPEG_BIN` (`/usr/bin/ffmpeg` on the Pi), and the
+  Pi's own API keys. New deps must be pip-installed on the Pi by hand (e.g.
+  `litellm`, added 2026-07-29 for the Anthropic `LitellmModel` wrapping).
 
-### Pi access (as of 2026-07-28: blocked)
+### Pi access (working as of 2026-07-29)
+
+Passwordless SSH key auth to the Pi is **set up and confirmed working**. Use:
+
+```bash
+ssh naoserver               # key auth, no password (alias in ~/.ssh/config)
+ssh nao@172.20.95.126       # equivalent, explicit host
+```
+
+`~/.ssh/config` has a `Host naoserver` block (`HostName 172.20.95.126`, `User
+nao`, `IdentityFile ~/.ssh/id_ed25519`). The same ed25519 key used for the robot
+is installed on the Pi. Runs Ubuntu 24.04.4 LTS (aarch64), Python 3.12.
 
 Its hostname is `naoserver`, and it runs `avahi-daemon`, so
 `dscacheutil -q host -a name naoserver.local` finds it without scanning — much
-faster than a subnet sweep, and it survives lease changes.
+faster than a subnet sweep, and it survives lease changes. `PI_IP` is also
+recorded in both `.env` files (informational; nothing reads it yet).
 
-**There is no working login from this laptop.** SSH key auth is set up for the
-robot but was never installed on the Pi, and the `nao` password (hashed in the
-SD card's `user-data`) is not in `.env` or any doc. Attempting to install a key
-by adding `ssh_authorized_keys` to `user-data` and bumping `instance-id` in
-`meta-data` did **not** work — cloud-init did not re-apply. Remaining options:
-a monitor + keyboard on the Pi, or the password from whoever imaged it.
-Backups of the originals are on the card as `user-data.bak.orig` /
-`meta-data.bak.orig`.
+**How the key finally got installed (2026-07-29).** The earlier attempts failed
+because `cmdline.txt` pins the cloud-init instance-id on the kernel command line
+(`ds=nocloud;i=<id>`), which **overrides `meta-data`** — so bumping `meta-data`
+alone never marked a new instance and per-instance modules (including the one
+that installs `ssh_authorized_keys`) never re-ran. Fix, from the SD card in a
+Mac: bump the id in **both** `cmdline.txt` and `meta-data`, and add a
+`bootcmd`/`runcmd` in `user-data` that runs `/boot/firmware/nao-fixssh.sh` — an
+idempotent script (still on the card) that generates host keys, installs the
+key, and starts `ssh.socket`. Gotchas learned: `systemctl restart ssh` from
+`bootcmd` hangs boot (do service starts in `runcmd`, timeout-guarded); Ubuntu
+uses **socket activation** so you must start `ssh.socket`, not just `ssh.service`;
+`enable_ssh: true` in `user-data` is a Raspberry Pi Imager-ism that does nothing.
+The script logs to `nao-provision.log` on the FAT boot partition (readable on a
+Mac) — read it there if SSH ever fails to come up again.
 
 Note `ssh`/`ssh-copy-id` password prompts **cannot** be answered from a
 non-interactive shell (including tool-run commands) — they fail instantly with
-`Permission denied` having never prompted. Run those in a real terminal.
+`Permission denied` having never prompted. Run those in a real terminal (not
+needed now that key auth works).
 
 ## Running it (development)
 
@@ -218,11 +246,27 @@ non-interactive shell (including tool-run commands) — they fail instantly with
 ./run.sh stop         # kill server + robot main.py
 ```
 
-**After every robot reboot you must run `./run.sh`.** On power-up a Choregraphe
-behavior autostarts `main.py` with no `SERVER_IP`, so it falls back to
-`nao/config.py`'s default — the **Pi at `.106`**. If the Pi is off, the robot
-wakes, calls a dead host, and silently does nothing. `run.sh` kills that process
-and relaunches pointed at your laptop.
+**Robot → server pointing (updated 2026-07-29).** On power-up a Choregraphe
+`nao-therapy-autostart` behavior runs `/home/nao/launch_nao_assist.sh`, which
+now launches `main.py` with **`SERVER_IP=172.20.95.126`** hard-set — so the
+robot autostarts against the **Pi** and works with no laptop around. (Before,
+the launcher set no `SERVER_IP` and `main.py` fell back to `nao/config.py`'s
+stale default `172.20.95.106`, a dead host — the robot woke and silently did
+nothing. `nao/config.py:23` still defaults to `.106`; the launcher override is
+what fixes it.) The robot's `NAO_SHARED_SECRET` (embedded in the launcher) was
+aligned to the Pi's `.env` so WS auth succeeds — **both must match** or the
+robot connects and is rejected. Backups: `launch_nao_assist.sh.bak.20260729`.
+Note `start_nao_assistant.sh` is a stale legacy launcher (points at `.106`) —
+not the active one.
+
+To relaunch `main.py` over SSH so it survives the session closing, use
+`setsid bash /home/nao/launch_nao_assist.sh </dev/null >/tmp/nao_launch.log 2>&1 &`
+(a plain `nohup … &` got SIGHUP'd and died). Verify with
+`ssh nao 'pgrep -af "[m]ain\.py"'` and tail `/home/nao/nao_assist.log`.
+
+**For development** (point the robot at your laptop instead of the Pi), run
+`./run.sh` — it kills the running `main.py` and relaunches pointed at your LAN
+IP with the laptop's secret.
 
 Do **not** hand-roll the rsync. `run.sh` also clears `.pyc` (Python 2 prefers
 stale bytecode, which makes edits silently no-op) and excludes `nao.log` —
