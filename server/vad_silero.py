@@ -122,6 +122,33 @@ def _try_load() -> bool:
             return False
 
 
+def _new_stream_model():
+    """Return a fresh, independent Silero model for ONE streaming session.
+
+    Each ``StreamingSilero`` owns its own model instance so concurrent sessions
+    — and the reconnect churn that accumulates over a long-running server —
+    cannot corrupt each other's RNN hidden state. That shared-state corruption
+    was the root cause of Silero confidence collapsing to ~0 and the arbiter
+    rejecting clearly-audible speech as ``no_voice`` (see CLAUDE.md). The model
+    is ~1-2 MB, so a copy per session is cheap.
+
+    Falls back to the shared singleton only if a fresh load fails, which at
+    worst restores the old (buggy-but-functional) shared behavior rather than
+    dropping VAD entirely.
+    """
+    if not _try_load():
+        return None
+    try:
+        from silero_vad import load_silero_vad  # type: ignore
+        return load_silero_vad()
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "vad_silero: per-session model load failed (%s); falling back to "
+            "the shared model (concurrent sessions may interfere)", e,
+        )
+        return _model
+
+
 def _read_wav_mono16k(path: str):
     """Read a WAV and return a float32 torch tensor at 16 kHz, mono.
 
@@ -400,6 +427,12 @@ class StreamingSilero:
         self._last_adaptive_recompute_ms = 0
         self._is_speech_now = False
 
+        # Per-session Silero model. Lazily created on first feed() so
+        # construction stays cheap and load failures degrade gracefully.
+        # Owning our own instance (rather than the module singleton) is what
+        # keeps concurrent sessions from corrupting each other's RNN state.
+        self._model = None
+
     # ---- public API --------------------------------------------------
 
     def feed(self, pcm_bytes: bytes) -> None:
@@ -416,6 +449,10 @@ class StreamingSilero:
             # Lazy-load failure — silently skip so callers aren't broken.
             # The adaptive threshold will stay at its default value.
             return
+
+        if self._model is None:
+            # First real audio for this session — bind our own model instance.
+            self._model = _new_stream_model()
 
         self._pcm_buffer.extend(pcm_bytes)
         bytes_per_frame = FRAME_SAMPLES * 2  # int16 little-endian
@@ -476,9 +513,12 @@ class StreamingSilero:
         self._adaptive_threshold = self.threshold
         self._last_adaptive_recompute_ms = 0
         self._is_speech_now = False
-        if _model is not None:
+        # Reset THIS session's own model, never the shared singleton — that
+        # cross-session wipe was the root cause of the confidence-collapse bug.
+        m = self._model
+        if m is not None:
             try:
-                _model.reset_states()  # Silero v5 RNN reset
+                m.reset_states()  # Silero v5 RNN reset
             except Exception as e:  # noqa: BLE001
                 log.debug("silero reset_states failed (non-fatal): %s", e)
 
@@ -512,10 +552,13 @@ class StreamingSilero:
         """Run one Silero step on exactly FRAME_SAMPLES of int16 PCM."""
         try:
             import torch  # type: ignore
+            # Use this session's own model; fall back to the shared singleton
+            # only if per-session load failed (degraded, not broken).
+            model = self._model if self._model is not None else _model
             samples = struct.unpack("<{}h".format(FRAME_SAMPLES), chunk)
             tensor = torch.tensor(samples, dtype=torch.float32) / 32768.0
             with torch.no_grad():
-                conf = float(_model(tensor, SAMPLE_RATE))
+                conf = float(model(tensor, SAMPLE_RATE))
         except Exception as e:  # noqa: BLE001
             self._frames_dropped += 1
             log.debug("vad_silero: streaming inference failed: %s", e)
