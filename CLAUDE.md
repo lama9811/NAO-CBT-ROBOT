@@ -364,14 +364,25 @@ Deepgram's output not at all. Don't "fix" the mic gain — measure first.
 
 ### Known bugs
 
-- **The CBT distortion classifier cannot say "no distortion."** `emotion.py:122`
-  prompts *"Choose exactly ONE from"* the ten labels in `_DISTORTIONS`, with no
-  none-of-these option, so a healthy thought gets labelled anyway. Verified
-  2026-07-30 against the live Pi: *"I studied hard, I did well, and I feel good
-  about it."* → `magnification/minimization`, with the model's own explanation
-  reading *"there's no distortion here."* NAO tells students their balanced
-  thinking is a cognitive distortion. Fix is a prompt change plus a `"none"`
-  branch in `identify_distortion`; not yet done.
+- **CBT classifier could not say "no distortion" — FIXED 2026-07-30 (`ebe5930`).**
+  The prompt said *"Choose exactly ONE from"* the ten labels in `_DISTORTIONS`
+  with no none-of-these option, so a balanced thought got a label anyway:
+  *"I studied hard, I did well, and I feel good about it."* →
+  `magnification/minimization`, while the model's own explanation read
+  *"there's no distortion here."* It knew, and the prompt left it no way to say
+  so — NAO told students their balanced thinking was a cognitive distortion.
+  `NO_DISTORTION = "none"` is now an allowed answer, and the prompt states that
+  a thought can be sad, worried, or negative about a genuinely bad situation
+  and still not be distorted (grief and disappointment were the cases most at
+  risk of being labelled). Downstream, `none` is a real answer, not a missing
+  one: nothing is written to `thought_records` (it would read back next session
+  as a distortion the student never had), `suggest_reframe` returns `[]` rather
+  than asking for alternatives to a thought exhibiting "none", and the coach
+  prompt says to acknowledge it warmly and skip the reframe step.
+  `_is_no_distortion()` normalizes `None` / `no distortion` / `n/a` / `""`.
+  Verified against live `claude-opus-5`: three healthy thoughts → `none`;
+  catastrophizing and mind-reading still named correctly.
+  Tests: `server/tests/test_no_distortion.py`.
 - **Whisper fallback hallucinated whole sentences — FIXED 2026-07-30.** STT fell
   through to OpenAI whenever Deepgram returned empty, and Whisper never returns
   empty on weak audio: it invents. On the robot's own mic recording the same
