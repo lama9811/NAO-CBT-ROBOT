@@ -99,6 +99,13 @@ def _synth_for(username: str, text: str,
       3. Server default ELEVENLABS_DEFAULT_PROFILE
       4. OpenAI fallback if none resolves to an EL voice ID
     """
+    # Strip Markdown before any provider sees it. The CS Navigator backend
+    # formats for a web UI ("**COSC 220**", "*   Dr. Ali - Professor"), and
+    # agents emit Markdown of their own, so without this NAO voices the
+    # asterisks and runs bulleted lists together without pausing.
+    from server.tts_text import to_speakable
+    text = to_speakable(text)
+
     use_eleven = (
         _eleven is not None
         and getattr(config, "USE_ELEVENLABS_TTS", True)

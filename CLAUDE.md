@@ -8,7 +8,7 @@ NAO humanoid robot assistant for Morgan State University, built on the **OpenAI 
 
 | Layer | Provider | Detail |
 |---|---|---|
-| **Ears** | ElevenLabs | Scribe `scribe_v1` via REST, falls back to OpenAI `gpt-4o-transcribe` |
+| **Ears** | Deepgram | `nova-3` batch REST, retrying once on `nova-2` when the first pass returns empty. **No OpenAI fallback** as of 2026-07-30 — see below. ElevenLabs Scribe is off (`USE_ELEVENLABS_STT=0`); ElevenLabs is TTS-only now. |
 | **Brain** | Anthropic | Haiku 4.5 for general chat/router/skills/embodied (fast, ~1s); Sonnet 5 for therapist + chatbot (depth); Opus 5 for crisis/safety. Chat moved off Sonnet 5 to Haiku on 2026-07-29 — Sonnet measured ~3.5s/reply (19.6s on tool-heavy turns), too slow for real-time. |
 | **Voice** | ElevenLabs | `eleven_flash_v2_5`, falls back to OpenAI `tts-1` |
 | **Safety + CBT tools + vision** | *configurable* | `CRISIS_MODEL` / `VISION_MODEL` — OpenAI by code default, but the live Mac + Pi `.env` now point them at Claude (`claude-opus-5` / `claude-sonnet-5`) as of 2026-07-29 |
@@ -285,12 +285,40 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
 
 | Var | Default | Notes |
 |---|---|---|
-| `MIC_CHANNEL` | `left` | Which of NAO's 4 mics to record. Measured: LEFT RMS≈1045 transcribes cleanly; FRONT ≈730 is weakest and made Whisper emit Chinese for English. `left\|right\|front\|rear\|all`. |
+| `MIC_CHANNEL` | `left` | Which of NAO's 4 mics to record. Re-measured 2026-07-30 on one 4-channel recording of a single source: LEFT rms 10003, RIGHT 10067, FRONT 6614, REAR 6147 — LEFT/RIGHT are ~1.5× the other two, so the default is right. `left\|right\|front\|rear\|all`. |
 | `ENGAGE_POSTURE` | `Sit` (code) | Posture on wake; `.env` currently overrides to `Stand`. `Sit` saves battery and mic noise; `none` disables. |
 | `SPEAKING_GESTURES` | `1` | `0` stops arm micro-gestures during TTS. |
+| `BOOT_GREETING` | `1` | NAO says `BOOT_GREETING_TEXT` and waves once it's ready to talk (after mic/TTS/LEDs/wake gates are built, just before `wsm.start()`). Latched once per process so the crash-retry loop doesn't re-greet. `0` disables. |
+| `BOOT_GREETING_TEXT` | `Hello, I'm NAO. How can I help you?` | Reword without a code change. Spoken by **native** NAOqi TTS, which is unmuted and re-muted to 0.0 in a `finally` — if that restore ever breaks, the kid voice leaks into every ElevenLabs reply. |
+
+**Mic gain is not adjustable and does not need to be** (measured 2026-07-30).
+`ALAudioDevice.setInputVolume` does not exist on this firmware — `_set_volume`
+logs `Can't find method: setInputVolume` at every boot and moves on. That is
+cosmetic: the ALSA `Capture` control already sits at **153900/65536 ≈ 235%**,
+above nominal max, so there is no headroom to add. Speech scaled to the robot's
+real capture level and mixed with its own recorded room noise transcribes
+perfectly on nova-3, and normalising or high-pass filtering it changed
+Deepgram's output not at all. Don't "fix" the mic gain — measure first.
 
 ### Server-side gotchas
 
+- **CS Navigator was wired but unreachable until 2026-07-30.** `chatbot.py`
+  imports `cs_navigator_search` (falling back to `vertex_search` only if that
+  import fails — it doesn't), but `CS_NAVIGATOR_URL` was empty on the Pi, so
+  every Morgan CS question returned the tool's polite *"I couldn't reach the CS
+  Navigator just now"* instead of an answer. It degrades quietly, so nothing
+  looked broken. Now set to
+  `https://csnavigator-backend-900141432581.us-central1.run.app` (public
+  `POST /chat/guest`, no token needed; the sibling `csnavigator-adk` service is
+  403/private and isn't used). Verified live: prerequisites → "COSC 220 requires
+  COSC 112 with a C or higher", 342 ms; faculty lookup 5.3 s.
+- **Everything TTS speaks goes through `server/tts_text.py:to_speakable()`.**
+  CS Navigator answers in Markdown (`**COSC 220**`, `*   Dr. Ali - Professor`)
+  because it was built for a web UI, and agents emit Markdown too. Without
+  stripping, NAO voices the asterisks and runs bulleted lists together with no
+  pause. `_synth_for` normalizes before any provider sees the text. It only
+  removes formatting — it never rewrites, reorders, or summarizes — and leaves
+  standalone `*` alone so "2 * 3" still reads as arithmetic.
 - **`FFMPEG_BIN`** must point at a real ffmpeg or `OPENAI_TTS_GAIN_DB` is
   *silently skipped* and NAO is barely audible. No Homebrew on this Mac; ffmpeg
   lives in a conda env. Check `logs/server.log` for `ffmpeg unavailable`.
@@ -336,6 +364,27 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
 
 ### Known bugs
 
+- **The CBT distortion classifier cannot say "no distortion."** `emotion.py:122`
+  prompts *"Choose exactly ONE from"* the ten labels in `_DISTORTIONS`, with no
+  none-of-these option, so a healthy thought gets labelled anyway. Verified
+  2026-07-30 against the live Pi: *"I studied hard, I did well, and I feel good
+  about it."* → `magnification/minimization`, with the model's own explanation
+  reading *"there's no distortion here."* NAO tells students their balanced
+  thinking is a cognitive distortion. Fix is a prompt change plus a `"none"`
+  branch in `identify_distortion`; not yet done.
+- **Whisper fallback hallucinated whole sentences — FIXED 2026-07-30.** STT fell
+  through to OpenAI whenever Deepgram returned empty, and Whisper never returns
+  empty on weak audio: it invents. On the robot's own mic recording the same
+  clip gave Deepgram `''` and Whisper `'それではまた。'`; live it produced
+  "Hallo." for "Hello" twice. Deepgram now owns the whole path (nova-3 → nova-2
+  retry → give up). `STT_ALLOW_OPENAI_FALLBACK=1` restores the old chain.
+- **`keywords` is a hard 400 on Nova-3 — FIXED 2026-07-30.** `deepgram_asr` sent
+  the legacy `keywords` param; Nova-3 wants `keyterm` and rejects the old name
+  outright. Because the adapter maps any non-200 to `""` and `transcribe()`
+  reads `""` as "this provider had nothing", **every** Deepgram request 400'd
+  silently and Whisper did all the work while the logs showed Deepgram healthy.
+  Term boosting is now chosen by model family. Watch for this shape of bug: a
+  provider that looks enabled, costs a round-trip, and never serves a request.
 - **Silero VAD shared model — FIXED 2026-07-29 (commit `7c7490b`).** `vad_silero._model`
   was a process-wide singleton feeding a stateful Silero v5 RNN from every
   session's `StreamingSilero`. Concurrent sessions interleaved audio into one
@@ -384,6 +433,13 @@ the robot's face DB *and* upserts the `users` row (`_emit_motion` →
   ignore/drop ICMP; "100% packet loss" told us the robot was dead three times
   while SSH was wide open. Test the port you actually need:
   `nc -z -G 4 172.20.95.123 22`.
+- **`main.py`'s structured logs are not in either obvious log file.** `logger.py`
+  writes to a dated JSONL under `~/nao_assist/logs/` — so `boot_start`,
+  `wake_engaged`, `boot_greeting_spoken` and friends appear in **none** of
+  `nao_assist.log` (the `tee` target, mostly `print()` output) or
+  `nao_assist/nao.log`. Grepping those two for a boot event finds zero hits and
+  looks like the event never fired. Read this instead:
+  `ssh nao 'tail -20 ~/nao_assist/logs/nao_$(date +%F).jsonl'`
 - Robot logs: `/home/nao/nao_assist/nao.log` (recreated by `run.sh` on launch).
 - `NAO_SHARED_SECRET` must not be inline in commands (the safety classifier
   blocks plaintext secrets, and `ps` exposes it on the robot). Source an env file.
