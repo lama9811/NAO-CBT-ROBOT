@@ -9,7 +9,7 @@ NAO humanoid robot assistant for Morgan State University, built on the **OpenAI 
 | Layer | Provider | Detail |
 |---|---|---|
 | **Ears** | ElevenLabs | Scribe `scribe_v1` via REST, falls back to OpenAI `gpt-4o-transcribe` |
-| **Brain** | Anthropic | Sonnet 5 for conversation lanes, Haiku 4.5 for router/skills/action |
+| **Brain** | Anthropic | Haiku 4.5 for general chat/router/skills/embodied (fast, ~1s); Sonnet 5 for therapist + chatbot (depth); Opus 5 for crisis/safety. Chat moved off Sonnet 5 to Haiku on 2026-07-29 — Sonnet measured ~3.5s/reply (19.6s on tool-heavy turns), too slow for real-time. |
 | **Voice** | ElevenLabs | `eleven_flash_v2_5`, falls back to OpenAI `tts-1` |
 | **Safety + CBT tools + vision** | *configurable* | `CRISIS_MODEL` / `VISION_MODEL` — OpenAI by code default, but the live Mac + Pi `.env` now point them at Claude (`claude-opus-5` / `claude-sonnet-5`) as of 2026-07-29 |
 
@@ -190,6 +190,15 @@ The Pi is the always-on brain so the robot works with nobody's laptop around
   collaborator's fork `theaayushstha1/...` on 2026-07-29; that fork's `main` was
   stale). It tracks `main`, so push to `main` (`git push origin HEAD:main`) then
   `ssh naoserver 'cd ~/nao-sagecbt && git pull && sudo systemctl restart nao-server'`.
+  **Auto-deploy is set up (2026-07-29):** a systemd timer `nao-autodeploy.timer`
+  on the Pi runs `/home/nao/auto-deploy.sh` every 2 min — it `git fetch`es and,
+  only when `main` moved, fast-forwards and restarts `nao-server` (logs to
+  `~/auto-deploy.log`). So a plain push to `main` reaches the Pi within ~2 min
+  with no manual step. A local `git deploy` alias (`.git/config`) pushes AND
+  triggers the same script immediately for instant deploys. Pause with
+  `ssh naoserver 'sudo systemctl stop nao-autodeploy.timer'`. GitHub webhooks
+  can't reach the Pi (no public address behind Morgan's NAT) — hence the Pi
+  polls out rather than being pushed to.
 - **`.env` reaches the Pi by neither.** It is gitignored, so every key and model
   setting must be recreated there by hand. A Pi that pulled fine but behaves
   like an older build is almost always an out-of-date `.env`. As of 2026-07-29
@@ -301,6 +310,16 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
   batch REST path is what actually runs.
 - **`USE_DEEPGRAM=1` / `USE_ELEVENLABS_TTS=1` are no-ops without their keys** —
   everything falls through to OpenAI. Read the boot log, not the flag.
+- **ElevenLabs keys are permission-scoped — a REST test passing does NOT mean
+  the live path works** (learned 2026-07-29). The server uses the **WebSocket
+  streaming** TTS and **Scribe STT**, which need the `speech_to_text` and
+  streaming scopes. A key scoped for REST `text_to_speech` only returns `200` on
+  `POST /v1/text-to-speech` yet 401s (`invalid_api_key`) on the WS stream and STT
+  — so both silently fall back to OpenAI (`elevenlabs_synth_returned_none`,
+  `[transcribe] elevenlabs returned empty; falling back to whisper`) and every
+  reply wastes ~2s on the failed attempt first. Verify a new key against the
+  paths the server actually uses: `synthesize_stream` (WS) and `POST
+  /v1/speech-to-text`, not just REST synth.
 - **Dead env vars are a recurring trap.** A `*_MODEL` var only works if
   something reads `config.X`. `CBT_MODEL` / `GROUNDING_MODEL` existed for months
   and were read by nothing (both coaches read `THERAPIST_MODEL`) — setting them
@@ -315,17 +334,18 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
   `topologies/safety_agent.py`, which only runs under the SAGE research
   topologies. The live gate is `safety.py` + `CRISIS_MODEL`.
 
-### Known bugs (unfixed as of 2026-07-28)
+### Known bugs
 
-- **Silero VAD shares one model across sessions.** `vad_silero._model` is a
-  process-wide singleton, but Silero v5 is a stateful RNN and each session gets
-  its own `StreamingSilero` wrapper feeding it. Concurrent sessions interleave
-  audio into one hidden state and confidence collapses to ~0; one session's
-  `reset()` calls `_model.reset_states()` and wipes another's state mid-turn.
-  Symptom: `reject_reason=silero_no_speech` **with a full, correct transcript**
-  — STT heard you fine, the gate in front of the agent threw it away. Gets worse
-  as WebSocket reconnects accumulate; `./run.sh` clears it. Fix is a per-session
-  model instance (the VAD model is ~1-2 MB, so copies are cheap).
+- **Silero VAD shared model — FIXED 2026-07-29 (commit `7c7490b`).** `vad_silero._model`
+  was a process-wide singleton feeding a stateful Silero v5 RNN from every
+  session's `StreamingSilero`. Concurrent sessions interleaved audio into one
+  hidden state and one session's `reset()` wiped another's; confidence collapsed
+  to ~0 and turns were rejected (`reject_reason=no_voice` / `silero_no_speech`)
+  on clearly-audible PCM, worsening as WS reconnects piled up. Fix: each
+  `StreamingSilero` now builds its own model via `_new_stream_model()` (~1-2 MB;
+  batch `has_voice`/`trim_silence` still share the singleton — stateless use).
+  Regression test: `server/tests/test_silero_per_session.py`. If `no_voice`
+  rejections ever return, first check that fix is still present, then restart.
 - **The crisis gate only consults the LLM when a keyword matches.** No match in
   `_SOFT_TRIGGERS` → returns `clean` without any model call. It matches
   contracted forms only, so *"I do not want to be here anymore"* misses (the
