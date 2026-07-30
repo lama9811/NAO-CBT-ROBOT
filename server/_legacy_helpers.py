@@ -512,6 +512,38 @@ def _deepgram_transcribe(path: str) -> str:
     return deepgram_asr.transcribe(path)
 
 
+def _dump_unheard_wav(path: str) -> None:
+    """Keep a copy of any turn that produced no transcript.
+
+    Turn WAVs are deleted as soon as the turn ends, so a "NAO didn't hear me"
+    report leaves nothing to examine — and synthetic reproductions don't
+    reproduce it (speech at the robot's real level, mixed with the robot's own
+    room noise, transcribes cleanly). This preserves the one artifact that
+    settles it: the exact bytes the engine heard nothing in.
+
+    Off unless STT_DEBUG_DUMP_DIR is set. Best-effort; never breaks a turn.
+    """
+    dump_dir = (os.environ.get("STT_DEBUG_DUMP_DIR") or "").strip()
+    if not dump_dir:
+        return
+    try:
+        import shutil
+        import time as _time
+        os.makedirs(dump_dir, exist_ok=True)
+        stamp = _time.strftime("%Y%m%d-%H%M%S")
+        dest = os.path.join(dump_dir, "unheard-{0}.wav".format(stamp))
+        shutil.copyfile(path, dest)
+        try:
+            with wave.open(dest, "rb") as w:
+                secs = w.getnframes() / float(w.getframerate() or 1)
+        except Exception:
+            secs = -1.0
+        print("[stt_dump] saved unheard turn: {0} ({1:.2f}s)".format(dest, secs),
+              flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print("[stt_dump] failed: {0!r}".format(exc), flush=True)
+
+
 def transcribe(path: str) -> str:
     """Speech to text. Deepgram owns this, including its own retry.
 
@@ -529,6 +561,7 @@ def transcribe(path: str) -> str:
         if not getattr(config, "STT_ALLOW_OPENAI_FALLBACK", False):
             print("[transcribe] deepgram heard no speech; returning empty "
                   "(STT_ALLOW_OPENAI_FALLBACK=0)", flush=True)
+            _dump_unheard_wav(path)
             return ""
         print("[transcribe] deepgram returned empty; falling back to whisper",
               flush=True)

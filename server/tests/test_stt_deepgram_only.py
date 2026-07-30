@@ -117,3 +117,33 @@ def test_openai_fallback_restorable_by_flag(monkeypatch, wav):
     )
 
     assert L.transcribe(wav) == "whisper heard this"
+
+
+def test_unheard_turn_is_saved_when_dump_dir_is_set(monkeypatch, tmp_path, wav):
+    """The failing audio is the one artifact that settles 'NAO didn't hear me'."""
+    from server import _legacy_helpers as L
+    from server import config
+
+    dump = tmp_path / "unheard"
+    monkeypatch.setenv("STT_DEBUG_DUMP_DIR", str(dump))
+    monkeypatch.setattr(config, "USE_DEEPGRAM", True)
+    monkeypatch.setattr(config, "USE_ELEVENLABS_STT", False)
+    monkeypatch.setattr(config, "STT_ALLOW_OPENAI_FALLBACK", False, raising=False)
+    monkeypatch.setattr(L, "_deepgram_transcribe", lambda path: "")
+
+    assert L.transcribe(wav) == ""
+    assert list(dump.glob("unheard-*.wav")), "no audio kept for the failing turn"
+
+
+def test_nothing_saved_when_dump_dir_unset(monkeypatch, tmp_path, wav):
+    from server import _legacy_helpers as L
+    from server import config
+
+    monkeypatch.delenv("STT_DEBUG_DUMP_DIR", raising=False)
+    monkeypatch.setattr(config, "USE_DEEPGRAM", True)
+    monkeypatch.setattr(config, "USE_ELEVENLABS_STT", False)
+    monkeypatch.setattr(config, "STT_ALLOW_OPENAI_FALLBACK", False, raising=False)
+    monkeypatch.setattr(L, "_deepgram_transcribe", lambda path: "")
+
+    assert L.transcribe(wav) == ""
+    assert not list(tmp_path.glob("**/unheard-*.wav"))
