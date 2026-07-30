@@ -87,6 +87,17 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 DEEPGRAM_MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-2")
 DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "en-US")
 USE_DEEPGRAM = bool(DEEPGRAM_API_KEY) and os.environ.get("USE_DEEPGRAM", "1") == "1"
+# Second Deepgram pass when the primary model returns an empty transcript, so
+# the retry stays inside Deepgram instead of handing off to another vendor.
+# Empty string disables the retry.
+DEEPGRAM_FALLBACK_MODEL = os.environ.get("DEEPGRAM_FALLBACK_MODEL", "nova-2")
+# When every Deepgram pass comes back empty, stop there by default rather than
+# asking OpenAI. Whisper never returns empty on weak audio — it invents words
+# ("Hallo", and a Japanese sentence out of pure room noise), and NAO then
+# answers a sentence the user never said. An empty transcript is rejected and
+# NAO stays quiet, which is the better failure. Set to 1 to restore the old
+# chain if Deepgram is ever unavailable.
+STT_ALLOW_OPENAI_FALLBACK = os.environ.get("STT_ALLOW_OPENAI_FALLBACK", "0") == "1"
 REALTIME_MODEL = os.environ.get("REALTIME_MODEL", "gpt-realtime")
 REALTIME_VAD_THRESHOLD = float(os.environ.get("REALTIME_VAD_THRESHOLD", "0.30"))
 REALTIME_VAD_PREFIX_MS = int(os.environ.get("REALTIME_VAD_PREFIX_MS", "500"))

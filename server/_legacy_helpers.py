@@ -506,12 +506,30 @@ def partial_wait_limit_hit(username: str) -> bool:
 
 # ───────── ASR ─────────
 
+def _deepgram_transcribe(path: str) -> str:
+    """Indirection so tests can stub the provider without touching HTTP."""
+    from server import deepgram_asr
+    return deepgram_asr.transcribe(path)
+
+
 def transcribe(path: str) -> str:
+    """Speech to text. Deepgram owns this, including its own retry.
+
+    When every Deepgram pass comes back empty we stop and return "" rather
+    than asking OpenAI. Deepgram reports silence honestly; Whisper never
+    returns empty on weak audio — it invents words, and NAO then answers a
+    sentence the user never said. An empty transcript is rejected upstream and
+    NAO stays quiet, which is the better failure. `STT_ALLOW_OPENAI_FALLBACK=1`
+    restores the old chain if Deepgram is ever unavailable.
+    """
     if config.USE_DEEPGRAM:
-        from server import deepgram_asr
-        text = deepgram_asr.transcribe(path)
+        text = _deepgram_transcribe(path)
         if text:
             return text
+        if not getattr(config, "STT_ALLOW_OPENAI_FALLBACK", False):
+            print("[transcribe] deepgram heard no speech; returning empty "
+                  "(STT_ALLOW_OPENAI_FALLBACK=0)", flush=True)
+            return ""
         print("[transcribe] deepgram returned empty; falling back to whisper",
               flush=True)
     if getattr(config, "USE_ELEVENLABS_STT", False):

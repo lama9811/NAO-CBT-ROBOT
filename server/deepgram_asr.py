@@ -38,11 +38,32 @@ def _term_boost_params(model: str) -> list[tuple[str, str]]:
 
 
 def transcribe(path: str) -> str:
+    """Transcribe `path`, retrying on a second Deepgram model if the first
+    pass hears nothing.
+
+    Deepgram reports silence honestly, which is what we want — but a single
+    empty result shouldn't end the turn while another Deepgram model might
+    still find the words. The retry only fires on an empty transcript, so a
+    successful first pass never pays the extra round-trip.
+    """
+    text = _transcribe_with(path, config.DEEPGRAM_MODEL)
+    if text:
+        return text
+
+    fallback = (getattr(config, "DEEPGRAM_FALLBACK_MODEL", "") or "").strip()
+    if not fallback or fallback == config.DEEPGRAM_MODEL:
+        return ""
+    print("[deepgram] {0} returned empty; retrying on {1}".format(
+        config.DEEPGRAM_MODEL, fallback), flush=True)
+    return _transcribe_with(path, fallback)
+
+
+def _transcribe_with(path: str, model: str) -> str:
     if not config.DEEPGRAM_API_KEY:
         return ""
 
     params = {
-        "model": config.DEEPGRAM_MODEL,
+        "model": model,
         "language": config.DEEPGRAM_LANGUAGE,
         "smart_format": "true",
         "punctuate": "true",
@@ -57,7 +78,7 @@ def transcribe(path: str) -> str:
             audio_bytes = f.read()
         # Build the URL manually so we can repeat the term-boost param.
         from urllib.parse import urlencode
-        flat_params = list(params.items()) + _term_boost_params(config.DEEPGRAM_MODEL)
+        flat_params = list(params.items()) + _term_boost_params(model)
         url = _LISTEN_URL + "?" + urlencode(flat_params)
         resp = requests.post(url, headers=headers, data=audio_bytes, timeout=_TIMEOUT_S)
     except Exception as e:
