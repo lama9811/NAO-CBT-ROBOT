@@ -14,14 +14,27 @@ from server import config
 _LISTEN_URL = "https://api.deepgram.com/v1/listen"
 _TIMEOUT_S = 15.0
 
-# Boost domain terms NAO and Morgan students actually say. Keyword:weight syntax.
-_KEYWORDS = [
-    "Morgan:5",
-    "NAO:5",
-    "CBT:5",
-    "therapist:5",
-    "Aayush:5",
-]
+# Boost domain terms NAO and Morgan students actually say.
+_TERMS = ["Morgan", "NAO", "CBT", "therapist", "Aayush"]
+
+# Legacy `keywords` syntax carries a per-term weight; Nova-3's `keyterm` does
+# not accept one. Weight applies only to the models that still take `keywords`.
+_KEYWORD_WEIGHT = 5
+
+
+def _term_boost_params(model: str) -> list[tuple[str, str]]:
+    """Query params that boost `_TERMS`, named for the model family.
+
+    Nova-3 dropped `keywords` and rejects it outright — every request comes
+    back `400 INVALID_QUERY_PARAMETER: Keywords are not supported for Nova-3.
+    Please use \x60keyterm\x60 instead.` The adapter turns any non-200 into ""
+    and `transcribe()` reads "" as "this provider had nothing", so the whole
+    thing failed silently: Deepgram looked enabled, every turn paid a wasted
+    round-trip, and Whisper quietly did the work.
+    """
+    if (model or "").lower().startswith("nova-3"):
+        return [("keyterm", t) for t in _TERMS]
+    return [("keywords", "{0}:{1}".format(t, _KEYWORD_WEIGHT)) for t in _TERMS]
 
 
 def transcribe(path: str) -> str:
@@ -34,8 +47,6 @@ def transcribe(path: str) -> str:
         "smart_format": "true",
         "punctuate": "true",
     }
-    # requests serializes repeated `keywords` query params correctly when
-    # given a list value with the same key.
     headers = {
         "Authorization": "Token {0}".format(config.DEEPGRAM_API_KEY),
         "Content-Type": "audio/wav",
@@ -44,9 +55,9 @@ def transcribe(path: str) -> str:
     try:
         with open(path, "rb") as f:
             audio_bytes = f.read()
-        # Build the URL manually so we can append multiple `keywords` params.
+        # Build the URL manually so we can repeat the term-boost param.
         from urllib.parse import urlencode
-        flat_params = list(params.items()) + [("keywords", k) for k in _KEYWORDS]
+        flat_params = list(params.items()) + _term_boost_params(config.DEEPGRAM_MODEL)
         url = _LISTEN_URL + "?" + urlencode(flat_params)
         resp = requests.post(url, headers=headers, data=audio_bytes, timeout=_TIMEOUT_S)
     except Exception as e:
