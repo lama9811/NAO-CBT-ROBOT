@@ -84,6 +84,25 @@ _DISTORTIONS = (
     "magnification/minimization", "filtering",
 )
 
+# The answer for a thought that simply isn't distorted. Without this the
+# classifier was forced to pick one of the ten above, so a balanced thought
+# got a label anyway — the model would return "magnification/minimization"
+# while its own explanation read "there's no distortion here." Telling a
+# student their healthy thinking is a cognitive distortion is the wrong
+# direction of error for a CBT tool.
+NO_DISTORTION = "none"
+
+# The model won't always spell it the way the prompt asked.
+_NO_DISTORTION_FORMS = frozenset({
+    "", "none", "no distortion", "no distortions", "n/a", "na",
+    "not distorted", "no cognitive distortion", "null",
+})
+
+
+def _is_no_distortion(label: str) -> bool:
+    """True when `label` means "this thought is fine as it is"."""
+    return (label or "").strip().lower().strip(".") in _NO_DISTORTION_FORMS
+
 
 def _unwrap(ctx) -> dict:
     return ctx.context if isinstance(ctx, RunContextWrapper) else ctx
@@ -119,9 +138,15 @@ def log_emotion(ctx: RunContextWrapper, mood: str, intensity: int, trigger: str)
 
 def _classify_distortion(thought: str) -> dict:
     prompt = (
-        "Classify the cognitive distortion in the user's thought. Choose exactly "
-        "ONE from: " + ", ".join(_DISTORTIONS) + ". Respond as JSON: "
-        '{"distortion": "<name>", "explanation": "<one sentence, gentle tone>"}'
+        "Identify the cognitive distortion in the user's thought, if there is "
+        "one. Choose exactly ONE from: " + ", ".join(_DISTORTIONS) + ". "
+        'If the thought is balanced, realistic, or fair — including thoughts '
+        'that are simply sad, worried, or negative about a genuinely bad '
+        'situation — answer "' + NO_DISTORTION + '". Not every difficult '
+        "thought is distorted, and saying so when it isn't is worse than "
+        "saying nothing. Respond as JSON: "
+        '{"distortion": "<name or ' + NO_DISTORTION + '>", '
+        '"explanation": "<one sentence, gentle tone>"}'
     )
     out = llm_compat.chat(
         model=config.CRISIS_MODEL,
@@ -166,14 +191,30 @@ def _persist_reframe(ctx, thought: str, reframe_text: str) -> None:
         pass
 
 
+def _identify_distortion_and_persist(ctx, thought: str) -> dict:
+    """Classify `thought`, recording it only when it is actually distorted.
+
+    A `none` result is a real answer, not a failure — and it must not land in
+    `thought_records`, where it would read back as a distortion the student
+    never had.
+    """
+    out = _identify_distortion_impl(thought)
+    if not isinstance(out, dict):
+        return out
+    label = (out.get("distortion") or "").strip()
+    if _is_no_distortion(label):
+        out["distortion"] = NO_DISTORTION
+        return out
+    _persist_thought(ctx, thought, label)
+    return out
+
+
 @function_tool
 def identify_distortion(ctx: RunContextWrapper, thought: str) -> dict:
-    """Identify one CBT cognitive distortion in the user's thought with a gentle explanation."""
-    out = _identify_distortion_impl(thought)
-    distortion_name = (out.get("distortion") or "").strip() if isinstance(out, dict) else ""
-    if distortion_name:
-        _persist_thought(ctx, thought, distortion_name)
-    return out
+    """Identify one CBT cognitive distortion in the user's thought, or report
+    that there is none. Returns distortion="none" when the thought is balanced
+    — say so warmly and do not invent a distortion."""
+    return _identify_distortion_and_persist(ctx, thought)
 
 
 def _reframe_impl(thought: str, distortion: str) -> list[str]:
@@ -195,13 +236,27 @@ def _reframe_impl(thought: str, distortion: str) -> list[str]:
     return json.loads(out)["reframes"]
 
 
-@function_tool
-def suggest_reframe(ctx: RunContextWrapper, thought: str, distortion: str) -> list[str]:
-    """Return two balanced reframes for a thought exhibiting the given distortion."""
+def _suggest_reframe_and_persist(ctx, thought: str, distortion: str) -> list[str]:
+    """Reframes for a distorted thought — and nothing for a healthy one.
+
+    Asking the model for "alternatives to a thought exhibiting none" produces
+    nonsense, and offering to fix a thought that isn't broken undercuts the
+    student's own balanced thinking.
+    """
+    if _is_no_distortion(distortion):
+        return []
     reframes = _reframe_impl(thought, distortion)
     if reframes:
         _persist_reframe(ctx, thought, reframes[0])
     return reframes
+
+
+@function_tool
+def suggest_reframe(ctx: RunContextWrapper, thought: str, distortion: str) -> list[str]:
+    """Return two balanced reframes for a thought exhibiting the given
+    distortion. Returns an empty list when the distortion is "none" — a
+    balanced thought needs no reframing."""
+    return _suggest_reframe_and_persist(ctx, thought, distortion)
 
 
 # ────────── observe_face ──────────
