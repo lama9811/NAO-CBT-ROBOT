@@ -56,14 +56,48 @@ except Exception:  # pragma: no cover -- module always present, keep belt+braces
     _eleven = None  # type: ignore[assignment]
 
 
-def _synth_for(username: str, text: str) -> bytes | None:
+# Usernames that stand in for "we don't know who this is yet". Every WS
+# session opens as `guest` and is only renamed once face reco or the name
+# prompt resolves an identity, so these are shared by every stranger who
+# ever talks to the robot — they must never accumulate durable preferences.
+_ANONYMOUS_USERNAMES = frozenset({"", "guest", "unknown"})
+
+
+def _is_anonymous(username: str) -> bool:
+    return (username or "").strip().lower() in _ANONYMOUS_USERNAMES
+
+
+def _resolve_voice_profile(username: str, override: str | None) -> str:
+    """Return the voice profile to synthesize `username`'s next line with.
+
+    Order: this session's in-flight override → the user's persisted pick →
+    the server default. Anonymous sessions skip the persisted lookup: the
+    `guest` row is shared by everyone, so honouring it meant one stranger's
+    "man voice" became the opening voice for every session that followed —
+    which then audibly flipped to the real user's voice the moment identity
+    resolved, a few seconds in.
+    """
+    if override:
+        return override
+    if not _is_anonymous(username):
+        from server import session as _ses
+        stored = _ses.get_voice_profile(username)
+        if stored:
+            return stored
+    return getattr(config, "ELEVENLABS_DEFAULT_PROFILE", "girl")
+
+
+def _synth_for(username: str, text: str,
+               profile_override: str | None = None) -> bytes | None:
     """Pick TTS provider per-call. Tries ElevenLabs first when enabled
     and available; falls back to OpenAI on any failure / missing key.
 
-    Voice profile resolution order:
-      1. Per-user pref via session.get_voice_profile(username)
-      2. Server default ELEVENLABS_DEFAULT_PROFILE
-      3. OpenAI fallback if neither resolves to an EL voice ID
+    Voice profile resolution order (see `_resolve_voice_profile`):
+      1. This session's in-flight override (`sess.voice_profile_override`)
+      2. Per-user pref via session.get_voice_profile(username), skipped for
+         anonymous sessions
+      3. Server default ELEVENLABS_DEFAULT_PROFILE
+      4. OpenAI fallback if none resolves to an EL voice ID
     """
     use_eleven = (
         _eleven is not None
@@ -72,9 +106,7 @@ def _synth_for(username: str, text: str) -> bytes | None:
     )
     if use_eleven:
         try:
-            from server import session as _ses
-            profile = _ses.get_voice_profile(username) or \
-                      getattr(config, "ELEVENLABS_DEFAULT_PROFILE", "girl")
+            profile = _resolve_voice_profile(username, profile_override)
             voice_id = _eleven._voice_id_for(profile) or \
                        _eleven._resolve_default_voice_id()
             if voice_id:
@@ -942,6 +974,10 @@ class _Session:
         "_therapy_turn_count",
         # Phase 11.10 — per-session streaming STT (ElevenLabs Scribe Realtime).
         "_streaming_stt",
+        # In-flight voice pick ("voice 2" / "man voice" mid-session). Lives
+        # here rather than only in user_prefs so an anonymous session can
+        # switch voices without pinning the choice on the shared `guest` row.
+        "voice_profile_override",
     )
 
     def __init__(self, username: str) -> None:
@@ -955,6 +991,7 @@ class _Session:
         self.image_b64: str | None = None
         self.turn_idx = 0
         self.out_seq = 0  # monotonic seq for outgoing audio_chunk frames
+        self.voice_profile_override: str | None = None
 
         # Phase 2: server-side streaming Silero (set lazily on first audio
         # chunk so a missing dependency at import time doesn't kill the
@@ -1209,6 +1246,7 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
     with _phase("tts_synth_first_chunk", phase_ms):
         mp3 = await asyncio.to_thread(
             _synth_for, sess.username, safety.HOTLINE_REPLY,
+            sess.voice_profile_override,
         )
     # Record the hotline reply for the substring/sentence echo guard before
     # we hand audio to the client — the next inbound transcript may echo it.
@@ -1235,7 +1273,15 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
 # ───────── motion-trigger short-circuit ─────────
 
 def _persist_voice_profile(sess: _Session, profile: str) -> None:
-    """Persist a voice-profile change for this session's user."""
+    """Apply a voice-profile change to this session, and persist it when we
+    know who asked.
+
+    An anonymous session gets the switch for the rest of its life but writes
+    nothing: `guest` is a shared row, so persisting there hands the pick to
+    every future stranger. The write happens later anyway for anyone who is
+    identified mid-session — `session.migrate_username` carries the prefs row
+    across the rename.
+    """
     from server import session as _ses
 
     clean = (profile or "").strip().lower()
@@ -1246,11 +1292,14 @@ def _persist_voice_profile(sess: _Session, profile: str) -> None:
             voice_profile=clean,
         )
         return
-    _ses.set_voice_profile(sess.username, clean)
+    sess.voice_profile_override = clean
+    anonymous = _is_anonymous(sess.username)
+    if not anonymous:
+        _ses.set_voice_profile(sess.username, clean)
     logger.info(
         "voice_profile_set",
         user=sess.username, session_id=sess.session_id,
-        voice_profile=clean,
+        voice_profile=clean, persisted=not anonymous,
     )
 
 
@@ -1306,7 +1355,9 @@ async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
         await _send_json(ws, _action_frame(motion.action, motion.args))
 
     with _phase("tts_synth_first_chunk", phase_ms):
-        mp3 = await asyncio.to_thread(_synth_for, sess.username, motion.ack)
+        mp3 = await asyncio.to_thread(
+            _synth_for, sess.username, motion.ack,
+            sess.voice_profile_override)
     _reset_reply_chunks(sess.username, motion.ack)
     if mp3:
         await _send_json(
@@ -1388,7 +1439,9 @@ async def _emit_onboarding_name_retry(
     phase_ms: dict[str, float] = {}
     with _phase("onboarding_name_retry_synth", phase_ms):
         try:
-            mp3 = await asyncio.to_thread(_synth_for, sess.username, text)
+            mp3 = await asyncio.to_thread(
+                _synth_for, sess.username, text,
+                sess.voice_profile_override)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "onboarding_name_retry_tts_failed",
@@ -1451,7 +1504,9 @@ async def _emit_returning_identity_greeting(
     phase_ms: dict[str, float] = {}
     with _phase("returning_identity_greeting_synth", phase_ms):
         try:
-            mp3 = await asyncio.to_thread(_synth_for, sess.username, text)
+            mp3 = await asyncio.to_thread(
+                _synth_for, sess.username, text,
+                sess.voice_profile_override)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "returning_identity_greeting_tts_failed",
@@ -1520,7 +1575,9 @@ async def _emit_onboarding_name_prompt(
     phase_ms: dict[str, float] = {}
     with _phase("onboarding_name_prompt_synth", phase_ms):
         try:
-            mp3 = await asyncio.to_thread(_synth_for, sess.username, text)
+            mp3 = await asyncio.to_thread(
+                _synth_for, sess.username, text,
+                sess.voice_profile_override)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "onboarding_name_prompt_tts_failed",
@@ -1883,7 +1940,9 @@ async def _emit_agent_turn(ws: WebSocket, sess: _Session,
                     ))
                     handoff_sent_for = final_reply["active_agent"]
                 t_synth = time.perf_counter()
-                mp3 = await asyncio.to_thread(_synth_for, sess.username, tts_text)
+                mp3 = await asyncio.to_thread(
+                    _synth_for, sess.username, tts_text,
+                    sess.voice_profile_override)
                 # Re-check after synth — barge_in can arrive during the
                 # synthesize call (which can take hundreds of ms). Dropping
                 # the freshly-synthesized chunk here keeps us within the
@@ -2634,6 +2693,7 @@ async def _handle_wake_event(ws: WebSocket, sess: _Session,
             with _phase("tts_synth_first_chunk", phase_ms):
                 mp3 = await asyncio.to_thread(
                     _synth_for, sess.username, greeting,
+                    sess.voice_profile_override,
                 )
 
             # Record for the substring/sentence echo guard before shipping
@@ -2873,7 +2933,9 @@ async def _maybe_announce_camera_consent(ws: WebSocket, sess: _Session) -> None:
     phase_ms: dict[str, float] = {}
     with _phase("camera_announce_synth", phase_ms):
         try:
-            mp3 = await asyncio.to_thread(_synth_for, sess.username, text)
+            mp3 = await asyncio.to_thread(
+                _synth_for, sess.username, text,
+                sess.voice_profile_override)
         except Exception as e:  # noqa: BLE001 — TTS down → silent skip
             logger.warning(
                 "camera_announce_tts_failed",

@@ -117,7 +117,7 @@ async def test_wake_event_binds_returning_username_before_session_resume(monkeyp
         lambda face_id: (True, "Aayush"),
     )
     monkeypatch.setattr(app_ws, "_last_recap_line", lambda username: None)
-    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text: b"mp3")
+    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text, profile_override=None: b"mp3")
 
     def _fake_ensure(username, hint):
         ensure_calls.append((username, hint))
@@ -169,7 +169,7 @@ def test_onboarding_name_retry_gives_up_after_max_retries(monkeypatch):
     pytest-asyncio is not a dependency of this project — the marker silently
     skips instead of running.
     """
-    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text: b"mp3")
+    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text, profile_override=None: b"mp3")
     sess = app_ws._Session("guest")
     sess.asking_name = True
     ws = _FakeWs()
@@ -200,7 +200,7 @@ def test_wake_event_asks_name_for_new_user(monkeypatch):
     monkeypatch.setattr(app_ws, "_emit_onboarding_name_prompt", _fake_prompt)
     monkeypatch.setattr(app_ws, "_lookup_returning_user", lambda face_id: (False, None))
     monkeypatch.setattr(app_ws, "_last_recap_line", lambda username: None)
-    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text: b"mp3")
+    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text, profile_override=None: b"mp3")
     monkeypatch.setattr(app_ws.legacy, "ensure_active_session", lambda u, h: 1)
 
     sess = app_ws._Session("guest")
@@ -232,7 +232,7 @@ def test_wake_event_does_not_ask_returning_user(monkeypatch):
     monkeypatch.setattr(app_ws, "_emit_returning_identity_greeting", _fake_greet)
     monkeypatch.setattr(app_ws, "_lookup_returning_user", lambda face_id: (True, "Aayush"))
     monkeypatch.setattr(app_ws, "_last_recap_line", lambda username: None)
-    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text: b"mp3")
+    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text, profile_override=None: b"mp3")
     monkeypatch.setattr(app_ws.legacy, "ensure_active_session", lambda u, h: 1)
 
     sess = app_ws._Session("guest")
@@ -264,7 +264,7 @@ def test_learn_face_persists_user_row(monkeypatch):
         app_ws.memory, "ensure_user",
         lambda face_id, display_name=None, **kw: saved.append((face_id, display_name)),
     )
-    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text: b"mp3")
+    monkeypatch.setattr(app_ws, "_synth_for", lambda username, text, profile_override=None: b"mp3")
     monkeypatch.setattr(app_ws, "_reset_reply_chunks", lambda u, t: None)
 
     sess = app_ws._Session("guest")
