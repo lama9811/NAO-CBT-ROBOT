@@ -122,6 +122,87 @@ def _set_volume(ip, port, level=100):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Boot greeting - one spoken line + a wave, once the robot is actually ready.
+# ---------------------------------------------------------------------------
+
+# Latched after the first successful announce. The call site sits inside
+# main()'s crash-retry loop, and a robot stuck in that loop repeating
+# "Hello, I'm NAO." at the room is worse than one that stays quiet.
+_boot_greeting_done = False
+
+_BOOT_GREETING_DEFAULT = "Hello, I'm NAO."
+# Loud enough to carry across a room without clipping the small speaker.
+_BOOT_GREETING_VOLUME = 0.9
+
+
+def _announce_ready(ip, port, log, proxy_factory=None):
+    """Speak one greeting through NAOqi's own voice and wave, once per process.
+
+    Native TTS is pinned at 0.0 everywhere else on purpose (the launcher and
+    `_set_volume` below both mute it) because the built-in kid voice otherwise
+    leaks into ElevenLabs replies as a second speaker. So this unmutes, speaks,
+    and re-mutes in a `finally` - if that restore is ever skipped, every
+    subsequent reply is spoken twice in two different voices.
+
+    The wave starts non-blocking so it overlaps the speech rather than
+    following it. Every failure is swallowed: a greeting must never be the
+    reason the robot fails to boot.
+
+    `proxy_factory` exists so tests can inject fakes; on the robot it defaults
+    to naoqi's ALProxy.
+    """
+    global _boot_greeting_done
+
+    if _boot_greeting_done:
+        return
+    if os.environ.get("BOOT_GREETING", "1").strip() == "0":
+        return
+
+    text = os.environ.get("BOOT_GREETING_TEXT", "").strip() \
+        or _BOOT_GREETING_DEFAULT
+    factory = proxy_factory or ALProxy
+    if factory is None:  # no naoqi on this machine
+        return
+
+    _boot_greeting_done = True
+    tts = None
+    try:
+        # Wave first and non-blocking, so the arm is already moving by the
+        # time the line starts.
+        try:
+            behav = factory("ALBehaviorManager", ip, port)
+            posture = factory("ALRobotPosture", ip, port)
+            nao_execute._ensure_stand_for_behavior(
+                posture, reason="boot_greeting")
+            behav.startBehavior("animations/Stand/Gestures/Hey_1")
+        except Exception as exc:
+            log.warn("boot_greeting_wave_failed", error=str(exc))
+
+        tts = factory("ALTextToSpeech", ip, port)
+        try:
+            tts.setVolume(_BOOT_GREETING_VOLUME)
+            tts.say(text)
+        finally:
+            # The one line that must always run. Leaving native TTS audible
+            # re-introduces the dual-voice bug on every reply.
+            try:
+                tts.setVolume(0.0)
+            except Exception as exc:
+                log.warn("boot_greeting_remute_failed", error=str(exc))
+        log.info("boot_greeting_spoken", text=text)
+    except Exception as exc:
+        log.warn("boot_greeting_failed", error=str(exc))
+        # Belt and braces: if we never reached the inner finally (e.g. the
+        # ALTextToSpeech proxy itself failed to build) there is nothing to
+        # restore, but if we did get a proxy, make sure it is silent.
+        if tts is not None:
+            try:
+                tts.setVolume(0.0)
+            except Exception:
+                pass
+
+
 def _disable_autonomous(ip, port):
     """Kill NAO's built-in autonomous life so it doesn't talk over us.
     setAutonomousAbilityEnabled persists across reboots; setState is per
@@ -1084,6 +1165,12 @@ def main():
                     leds.set_idle()
                 except Exception:
                     pass
+
+            # Everything the robot needs to hold a conversation is built by
+            # now - mic streamer, TTS player, LEDs, wake gates - so this is
+            # the first honest moment to claim "ready to talk". Latched
+            # inside, so the crash-retry loop doesn't re-greet.
+            _announce_ready(config.NAO_IP, config.NAO_PORT, log)
 
             wsm.start()  # blocks until stop()
             log.info("wake_state_machine_stopped")

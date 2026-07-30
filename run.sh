@@ -256,6 +256,8 @@ IMAGE_PER_TURN='${IMAGE_PER_TURN:-1}' \
 MIC_CHANNEL='${MIC_CHANNEL:-left}' \
 ENGAGE_POSTURE='${ENGAGE_POSTURE:-Sit}' \
 SPEAKING_GESTURES='${SPEAKING_GESTURES:-1}' \
+BOOT_GREETING='${BOOT_GREETING:-1}' \
+BOOT_GREETING_TEXT='${BOOT_GREETING_TEXT:-}' \
 nohup python -u /home/nao/nao_assist/main.py \
 > $ROBOT_LOG_REMOTE 2>&1 </dev/null &"
     sleep 2
