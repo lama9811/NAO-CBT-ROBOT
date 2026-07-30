@@ -107,7 +107,7 @@ def test_speaks_the_default_line(monkeypatch):
     rec = _Recorder()
     _announce(rec, monkeypatch)
 
-    assert rec.tts.said == ["Hello, I'm NAO."]
+    assert rec.tts.said == ["Hello, I'm NAO. How can I help you?"]
 
 
 def test_waves_while_greeting(monkeypatch):
@@ -158,7 +158,7 @@ def test_fires_only_once_per_process(monkeypatch):
     _announce(rec, monkeypatch)
     _announce(rec, monkeypatch)
 
-    assert rec.tts.said == ["Hello, I'm NAO."]
+    assert rec.tts.said == ["Hello, I'm NAO. How can I help you?"]
 
 
 def test_never_raises_when_naoqi_is_broken(monkeypatch):

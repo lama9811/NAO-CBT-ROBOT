@@ -131,7 +131,7 @@ def _set_volume(ip, port, level=100):
 # "Hello, I'm NAO." at the room is worse than one that stays quiet.
 _boot_greeting_done = False
 
-_BOOT_GREETING_DEFAULT = "Hello, I'm NAO."
+_BOOT_GREETING_DEFAULT = "Hello, I'm NAO. How can I help you?"
 # Loud enough to carry across a room without clipping the small speaker.
 _BOOT_GREETING_VOLUME = 0.9
 
