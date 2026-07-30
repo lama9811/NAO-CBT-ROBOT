@@ -110,6 +110,21 @@ except Exception:
     _VAD_AVAILABLE = False
 
 
+# Absolute floor, in milliseconds of webrtcvad-voiced audio, above which a clip
+# counts as containing speech no matter how much silence surrounds it.
+#
+# The ratio test alone asks the wrong question. `sess.audio_buf` starts filling
+# the instant the previous turn is finalized, so the clip is "thinking pause +
+# utterance" and the voiced *fraction* shrinks the longer the user takes to
+# start talking — the same sentence scored 0.42 after a 1 s pause and 0.07
+# after 8 s on the Pi. Turns then got dropped as `no_voice`, which the user
+# experiences as NAO going silent mid-conversation, worst in exactly the
+# slow, reflective turns the therapist lane exists for. 300 ms is ~10 frames:
+# comfortably more than a click or a door, comfortably less than any real
+# answer, and Silero still has to agree there is speech before we get here.
+_MIN_VOICED_MS = int(os.environ.get("VOICE_GATE_MIN_VOICED_MS", "300"))
+
+
 def has_voice(path: str, aggressiveness: int = 2,
               voiced_ratio_min: float = 0.18) -> bool:
     """True if at least `voiced_ratio_min` of 30 ms frames are detected as speech.
@@ -117,27 +132,66 @@ def has_voice(path: str, aggressiveness: int = 2,
     Layered: Silero VAD is the authoritative gate when it loads. webrtcvad is
     the fallback. Either rejecting drops the clip — but both are permissive on
     internal errors (return True) so we never block traffic on a VAD bug.
+
+    Emits a ``[voice_gate]`` trace per call. When a turn is rejected as
+    ``no_voice`` this is the only record of *which* of the two gates dropped
+    it and on what numbers — without it, a rejection of clearly-audible
+    speech is indistinguishable from a genuinely silent buffer.
     """
+    decision, detail = _has_voice_detail(path, aggressiveness, voiced_ratio_min)
     try:
-        if not vad_silero.has_voice(path):
-            return False
+        print(
+            "[voice_gate] decision={0} gate={1} silero={2} ratio={3} "
+            "voiced_ms={4} frames={5} dur_s={6} thr={7}/{8}ms".format(
+                decision, detail.get("gate"), detail.get("silero"),
+                detail.get("ratio"), detail.get("voiced_ms"),
+                detail.get("frames"), detail.get("dur_s"),
+                voiced_ratio_min, _MIN_VOICED_MS,
+            ),
+            flush=True,
+        )
     except Exception:
         pass
+    return decision
+
+
+def _has_voice_detail(path: str, aggressiveness: int,
+                      voiced_ratio_min: float) -> tuple[bool, dict]:
+    """`has_voice` decision plus the numbers behind it, for diagnostics.
+
+    Returns ``(decision, detail)`` where ``detail["gate"]`` names whichever
+    check settled the outcome. Decision semantics are byte-for-byte the same
+    as the pre-instrumentation implementation.
+    """
+    detail: dict = {"gate": None, "silero": None, "ratio": None,
+                    "frames": None, "dur_s": None}
+    try:
+        detail["silero"] = bool(vad_silero.has_voice(path))
+        if not detail["silero"]:
+            detail["gate"] = "silero"
+            return False, detail
+    except Exception:
+        detail["silero"] = "error"
     if not _VAD_AVAILABLE:
-        return True
+        detail["gate"] = "webrtc_unavailable"
+        return True, detail
     try:
         with wave.open(path, "rb") as w:
             sr = w.getframerate()
             ch = w.getnchannels()
             sw = w.getsampwidth()
             raw = w.readframes(w.getnframes())
+        if sr and sw:
+            detail["dur_s"] = round(len(raw) / float(sr * sw * (ch or 1)), 2)
         if ch != 1 or sw != 2 or sr not in (8000, 16000, 32000, 48000):
-            return True
+            detail["gate"] = "unsupported_format"
+            return True, detail
         vad = webrtcvad.Vad(aggressiveness)
         frame_ms = 30
         bytes_per_frame = int(sr * frame_ms / 1000) * sw
         if bytes_per_frame == 0 or len(raw) < bytes_per_frame:
-            return False
+            detail["gate"] = "too_short"
+            return False, detail
         n_total = 0
         n_voiced = 0
         for i in range(0, len(raw) - bytes_per_frame + 1, bytes_per_frame):
@@ -148,11 +202,25 @@ def has_voice(path: str, aggressiveness: int = 2,
                     n_voiced += 1
             except Exception:
                 continue
+        detail["frames"] = n_total
         if n_total == 0:
-            return False
-        return (n_voiced / n_total) >= voiced_ratio_min
-    except Exception:
-        return True
+            detail["gate"] = "no_frames"
+            return False, detail
+        ratio = n_voiced / n_total
+        voiced_ms = n_voiced * frame_ms
+        detail["ratio"] = round(ratio, 3)
+        detail["voiced_ms"] = voiced_ms
+        # Either enough speech in absolute terms, or a dense-enough clip.
+        # The absolute floor is what saves an answer that arrives after a
+        # long pause; the ratio keeps short clips as strict as they were.
+        if voiced_ms >= _MIN_VOICED_MS:
+            detail["gate"] = "webrtc_voiced_ms"
+            return True, detail
+        detail["gate"] = "webrtc_ratio"
+        return ratio >= voiced_ratio_min, detail
+    except Exception as exc:  # noqa: BLE001
+        detail["gate"] = "error:{0}".format(type(exc).__name__)
+        return True, detail
 
 
 # ───────── hallucination / echo filters ─────────
