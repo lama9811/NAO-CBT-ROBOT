@@ -80,7 +80,7 @@ Server (Python 3.11+) — everything under server/
   server/app_ws.py        LIVE: FastAPI + WebSocket /ws/{username}
   server/server.py        LEGACY: Flask POST /turn (USE_WS=0 only)
   server/safety.py        Pre-dispatch crisis gate (keyword + LLM, 988 hotline)
-  server/session.py       SQLiteSession wrapper + camera consent + therapy recaps
+  server/session.py       SQLiteSession wrapper (see session_key_for) + camera consent + therapy recaps
   server/agents/          Agent graph (router, chat, chatbot, skills, therapist, cbt_coach, grounding_coach)
   server/tools/           Tool modules (nao_actions, pinecone_search, emotion, skills_tools)
 ```
@@ -112,7 +112,7 @@ Server (Python 3.11+) — everything under server/
 | `server/model_factory.py` | `resolve_model()` — OpenAI string vs Claude `LitellmModel`, for Agents SDK agents |
 | `server/llm_compat.py` | `chat()` — provider-agnostic direct calls (system/JSON/image translation) |
 | `server/safety.py` | `crisis_check()` + hardcoded 988 hotline reply (keyword gate, LLM only on soft-trigger match) |
-| `server/session.py` | SQLiteSession + `{get,set}_camera_consent` + `{save,load}_recap` |
+| `server/session.py` | SQLiteSession + `session_key_for` (history scoping) + `{get,set}_camera_consent` + `{save,load}_recap` |
 | `server/agents/router.py` | Triage agent with handoffs |
 | `server/agents/chat.py` | General chat + NAO actions |
 | `server/agents/chatbot.py` | Morgan CS RAG |
@@ -135,6 +135,12 @@ Server (Python 3.11+) — everything under server/
 - NAO action tools append `{name, args}` records to a context-scoped `actions_queue`; after `Runner.run()` returns, the queue is read out and sent to NAO in the response JSON. NAO-side `utils/nao_execute.py` dispatches them.
 - Crisis gate runs **before** the agent sees the user message. Agent cannot override.
 - Camera consent persists in `user_prefs` table; therapist tool `set_camera_consent` toggles it; NAO honors the `suppress_image` flag in responses.
+- **Chat history scoping goes through `session.session_key_for()` — the only
+  place a SQLiteSession key is built.** Named users get a persistent
+  `user:<name>`; anonymous users get an idle-bounded `guest:<epoch>` so one
+  stranger's conversation never reaches the next. Never construct a key by
+  hand: a hardcoded `f"user:{name}"` reintroduces the shared-`guest` leak
+  (see Known bugs).
 
 ## Obsidian Vault
 
@@ -190,6 +196,22 @@ successful `ssh nao` reached the robot — confirm with `hostname` (the robot is
 not `naoserver`).
 
 To re-provision the key on a fresh machine: `ssh-copy-id nao@<current-ip>` (uses `NAO_PASSWORD` from `.env` once). VS Code Remote-SSH picks up the `Host nao` alias automatically.
+
+**Two people now have access (2026-08-24).** `authorized_keys` on **both** the
+robot and the Pi carries two ed25519 keys:
+
+| key comment | fingerprint (SHA256) |
+|---|---|
+| `mingmalama@Mingmas-MacBook-Air.local-nao` | `vAnzZ5kUYB5n7ItlWq63Zuopptp+eGJ3rkn36qlluh4` |
+| `phreemason@mac-nao` | `eZNX0mlfgFqzj+qBaCvpxK0Q7YcBky8JdhbTEekuEkg` |
+
+That file is the source of truth for who can reach the robot — read it, don't
+guess. `phreemason`'s key was listed **twice** on the robot (`ssh-copy-id` run
+twice); deduped 2026-08-24. Backups on both hosts:
+`~/.ssh/authorized_keys.bak.20260824`. Revoking someone is deleting their line
+from both hosts — but note **`passwordauthentication` is still `yes` on the
+Pi**, so removing a key does not remove access while anyone knows the `nao`
+password. Separate keys currently buy attribution, not exclusion.
 
 ### Making the IP static
 
@@ -283,6 +305,35 @@ Note `ssh`/`ssh-copy-id` password prompts **cannot** be answered from a
 non-interactive shell (including tool-run commands) — they fail instantly with
 `Permission denied` having never prompted. Run those in a real terminal (not
 needed now that key auth works).
+
+### Working with two people (since 2026-08-24)
+
+Three things collide when more than one person has access. None of them fail
+loudly — that's what makes them worth writing down.
+
+- **The robot has one brain at a time, and `./run.sh` takes it.** `run.sh`
+  kills the running `main.py` and relaunches it pointed at *your* LAN IP. If
+  two people run it, the second silently steals the robot from the first: no
+  error on either side, the loser's robot just stops answering. Say you're
+  taking the robot before you run it, and `./run.sh stop` when you're done.
+  `ssh nao 'pgrep -af "[m]ain\.py"'` shows *whether* it's in use but not by
+  whom — the `SERVER_IP=` in the process args does, so read that.
+- **`run.sh` also rsyncs `nao/` — last write wins.** Both editing robot code
+  and both deploying means whoever ran it most recently owns
+  `/home/nao/nao_assist/`, and the other's changes are gone with nothing
+  logged. Diff the robot's tree before deploying.
+- **Any push to `main` restarts production within ~2 min, unattended.**
+  `nao-autodeploy.timer` polls, fast-forwards and restarts `nao-server`.
+  Measured 2026-08-24: **~50 s from `git push` to the Pi serving the new
+  code**. With one person that's a convenience; with two it means a
+  half-finished push restarts the server mid-demo for someone else. Prefer
+  branches and deliberate merges, or pause the timer while demoing:
+  `ssh naoserver 'sudo systemctl stop nao-autodeploy.timer'`.
+
+`.env` is gitignored, so a second laptop starts with no keys at all and its own
+`NAO_SHARED_SECRET`. That's fine — `run.sh` forwards whichever secret that
+laptop has — but it does mean the robot only talks to the laptop that launched
+it most recently.
 
 ## Running it (development)
 
@@ -414,7 +465,17 @@ measuring and wrong that there is nothing to fix.
 - `pytest-asyncio` is **not installed**, so every `@pytest.mark.asyncio` test
   **silently skips**. Drive async tests with `asyncio.run()` instead.
 - ~32 tests fail on a clean tree (pre-existing). Diff against a stash before
-  blaming your change.
+  blaming your change — and pin the order when you do: **`pytest-randomly` is
+  active**, so the failure *set* shifts between runs and a naive before/after
+  comparison is noise. Use `-p no:randomly` on both sides. Two traps when
+  taking that baseline: the full suite makes live API calls and will exceed a
+  2-minute tool timeout (run a subset), and in **zsh an unquoted `$FILES`
+  variable does not word-split** — `pytest $SUBSET` passes one bogus path,
+  reports `no tests ran`, and a careless reading of that is "0 failures, no
+  regressions". Pass test paths as literal arguments.
+- **The Pi has no `sqlite3` CLI.** Inspecting `server/nao.db` there is
+  `python3 -c 'import sqlite3...'`. To copy the DB while the server is live,
+  use the backup API (`src.backup(dst)`) — a plain `cp` can tear under WAL.
 - **`ELEVENLABS_STT_MODEL` must be `scribe_v1`.** `config.py` defaults it to
   `scribe_v2_realtime`, which the REST endpoint rejects with
   `400 unsupported_model`. The realtime *WebSocket* additionally 403s without a
@@ -483,6 +544,37 @@ absent OpenAI key that is a wasted round-trip per turn; set it to `0` on any
 deploy not using OpenAI.
 
 ### Known bugs
+
+- **Anonymous chat history leaked between people — FIXED 2026-08-24 (`875badb`).**
+  `session.get_or_create_session` keyed the SDK `SQLiteSession` by
+  `user:<username>`, and everyone who isn't face-recognised is `guest` — so one
+  `user:guest` row accumulated **every anonymous conversation ever held**: 709
+  messages spanning 2026-05-11 → 2026-08-24 on the live Pi. A name introduced
+  on Jul 30 (*"Nice to meet you, Bob!"*) was recited to a different person on
+  **Aug 24, 25 days later**. On a CBT robot that means one student's
+  disclosures sit in the model's context while the next student talks. It also
+  meant every turn shipped hundreds of stale messages, so it was a latency and
+  cost bug too. The per-WS `session_id` UUID in the logs is **telemetry only**
+  — it never scoped history, so a fresh `session_open` looked like a fresh
+  conversation and wasn't.
+  Anonymous conversations now get an **idle-bounded epoch**, `guest:<epoch>`,
+  reset after `GUEST_IDLE_RESET_S` (default 900 s). Keyed on *idle*, not on
+  `session_id`, because WS connections drop every few seconds during long TTS
+  and each reconnect mints a fresh id — a per-connection key would sever a
+  conversation mid-sentence. The epoch lives in process memory, so a restart
+  also starts clean (fails closed). Named users keep a stable `user:<name>`,
+  now lowercased — which also fixes the `aayush`/`Aayush`/`ayush` fragmentation
+  visible in the live DB. `migrate_username` had to follow: it read
+  `user:<old>`, which nothing writes any more, so the face-reco handoff would
+  have migrated an *empty* row; it now resolves the live epoch via a
+  **non-minting** lookup (minting on read hands over a fresh empty row and
+  drops what the user just said) and retires the epoch afterwards.
+  Tests: `server/tests/test_guest_session_scope.py` (14 cases).
+  **Still open:** named users load unbounded history (`aayush` is at 181 and
+  climbing, all of it in context every turn). `WAKE_RESUME_WINDOW_S` gates the
+  *greeting* and returning-user detection — it does **not** gate the history
+  load, and nothing else does either. Trimming a therapy transcript is a
+  clinical call, so it was left alone deliberately.
 
 - **CBT classifier could not say "no distortion" — FIXED 2026-07-30 (`ebe5930`).**
   The prompt said *"Choose exactly ONE from"* the ten labels in `_DISTORTIONS`
