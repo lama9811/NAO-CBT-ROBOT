@@ -6,7 +6,10 @@ consent and a recaps table for therapist cross-session memory.
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -105,8 +108,84 @@ def _conn():
         c.close()
 
 
+# ---------------------------------------------------------------------------
+# Anonymous session scoping
+# ---------------------------------------------------------------------------
+#
+# Chat history is keyed by username. That is correct for a recognised student —
+# therapy continuity across visits is the point — but everyone who is *not*
+# face-recognised is `guest`, so a single `user:guest` row silently became a
+# shared transcript of every anonymous conversation ever held (709 messages,
+# 2026-05-11 -> 2026-08-24 on the Pi, with a name from Jul 30 being quoted back
+# to a different person on Aug 24). On a CBT robot that leaks one student's
+# disclosures into the next student's context window.
+#
+# Anonymous conversations therefore get an *idle-bounded epoch* instead: the
+# same key while the lane stays active, a fresh one once it has been quiet for
+# GUEST_IDLE_RESET_S. We key on idle rather than on the per-WebSocket
+# `session_id` because WS connections drop every few seconds during long TTS
+# playbacks (see the first-turn tracker below) — a per-connection key would
+# reset history mid-sentence. The epoch lives in process memory, so a server
+# restart also starts a fresh anonymous conversation, which fails closed.
+_ANONYMOUS_USERNAMES = frozenset({"", "guest", "unknown"})
+
+# 15 min: far longer than any reconnect storm, far shorter than the gap between
+# two people using the robot. Override per-deployment via the environment.
+GUEST_IDLE_RESET_S = float(os.environ.get("GUEST_IDLE_RESET_S", str(15 * 60)))
+
+_GUEST_EPOCH_TOKEN: str | None = None
+_GUEST_EPOCH_LAST_SEEN: float = 0.0
+
+
+def is_anonymous(username: str) -> bool:
+    """True when ``username`` names nobody in particular."""
+    return (username or "").strip().lower() in _ANONYMOUS_USERNAMES
+
+
+def session_key_for(username: str, *, now: float | None = None) -> str:
+    """Return the SQLiteSession key that ``username``'s history belongs in.
+
+    Named users get a stable ``user:<name>`` key so their history persists.
+    Anonymous users get ``guest:<epoch>``, shared only for the duration of one
+    conversation. ``now`` is injectable for tests.
+    """
+    global _GUEST_EPOCH_TOKEN, _GUEST_EPOCH_LAST_SEEN
+
+    if not is_anonymous(username):
+        return "user:{}".format(username.strip().lower())
+
+    stamp = time.time() if now is None else now
+    expired = (stamp - _GUEST_EPOCH_LAST_SEEN) > GUEST_IDLE_RESET_S
+    if _GUEST_EPOCH_TOKEN is None or expired:
+        _GUEST_EPOCH_TOKEN = uuid.uuid4().hex[:12]
+    _GUEST_EPOCH_LAST_SEEN = stamp
+    return "guest:{}".format(_GUEST_EPOCH_TOKEN)
+
+
+def live_anonymous_key() -> str | None:
+    """The anonymous epoch key currently in flight, without minting one.
+
+    Returns ``None`` when no anonymous conversation is open. Distinct from
+    ``session_key_for`` because callers that are *reading* the epoch (the face
+    reco handoff) must not create one as a side effect — doing so would migrate
+    a freshly-minted empty row and silently drop what the user just said.
+    """
+    return None if _GUEST_EPOCH_TOKEN is None else f"guest:{_GUEST_EPOCH_TOKEN}"
+
+
+def retire_anonymous_epoch() -> None:
+    """Close the current anonymous conversation.
+
+    Called once its history has been handed to a named user: the row now
+    belongs to that user, so the next stranger must start somewhere else.
+    """
+    global _GUEST_EPOCH_TOKEN, _GUEST_EPOCH_LAST_SEEN
+    _GUEST_EPOCH_TOKEN = None
+    _GUEST_EPOCH_LAST_SEEN = 0.0
+
+
 def get_or_create_session(username: str) -> SQLiteSession:
-    return SQLiteSession(session_id=f"user:{username}", db_path=_DB_PATH)
+    return SQLiteSession(session_key_for(username), db_path=_DB_PATH)
 
 
 def migrate_username(old: str, new: str) -> None:
@@ -116,13 +195,20 @@ def migrate_username(old: str, new: str) -> None:
     so we stay compatible with any future SDK table-name changes and avoid
     conflicting with the SDK's own file-level locking.
     """
-    old_sess = SQLiteSession(session_id=f"user:{old}", db_path=_DB_PATH)
-    new_sess = SQLiteSession(session_id=f"user:{new}", db_path=_DB_PATH)
+    old_is_anon = is_anonymous(old)
+    old_key = live_anonymous_key() if old_is_anon else session_key_for(old)
 
-    items = asyncio.run(old_sess.get_items())
-    if items:
-        asyncio.run(new_sess.add_items(items))
-    asyncio.run(old_sess.clear_session())
+    if old_key is not None:
+        old_sess = SQLiteSession(session_id=old_key, db_path=_DB_PATH)
+        new_sess = SQLiteSession(session_key_for(new), db_path=_DB_PATH)
+
+        items = asyncio.run(old_sess.get_items())
+        if items:
+            asyncio.run(new_sess.add_items(items))
+        asyncio.run(old_sess.clear_session())
+
+    if old_is_anon:
+        retire_anonymous_epoch()
 
     # Also migrate prefs rows if they exist
     with _conn() as c:
