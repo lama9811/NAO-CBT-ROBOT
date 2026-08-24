@@ -130,9 +130,11 @@ Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morg
 
 ## NAO Robot — Connection
 
-- **IP:** `172.20.95.123` (confirmed 2026-07-28). **Do not trust this number** —
-  the lease moved `.127` → `.123` between 2026-07-15 and 2026-07-28, and the Pi
-  moved too. Always resolve before use:
+- **IP:** `172.20.95.100` (confirmed 2026-08-24). **Do not trust this number** —
+  the lease moved `.127` → `.123` (2026-07-15 → 07-28), then `.123` → `.100` by
+  2026-08-24, when the **Pi took over the robot's old `.123`** — so a stale
+  `ssh nao` lands you on the Pi, and a stale `NAO_IP` makes `run.sh` rsync robot
+  code onto the server. The Pi moved `.126` → `.123` at the same time. Always resolve before use:
   `dscacheutil -q host -a name nao.local | grep ip_address`, and update `NAO_IP`
   in `.env` when it changes (`run.sh` reads it from there). See below for making
   it static.
@@ -147,7 +149,7 @@ Passwordless key auth is **set up and confirmed working (2026-07-15)** — an ed
 
 ```bash
 ssh nao                   # key auth, no password
-ssh nao@172.20.95.123     # equivalent, explicit host
+ssh nao@172.20.95.100     # equivalent, explicit host
 ssh nao@nao.local         # elsewhere, if mDNS resolves
 ```
 
@@ -155,16 +157,16 @@ ssh nao@nao.local         # elsewhere, if mDNS resolves
 
 ```
 Host nao
-  HostName 172.20.95.123
+  HostName 172.20.95.100
   User nao
   IdentityFile ~/.ssh/id_ed25519
 ```
 
-To re-provision the key on a fresh machine: `ssh-copy-id nao@172.20.95.123` (uses `NAO_PASSWORD` from `.env` once). VS Code Remote-SSH picks up the `Host nao` alias automatically.
+To re-provision the key on a fresh machine: `ssh-copy-id nao@172.20.95.100` (uses `NAO_PASSWORD` from `.env` once). VS Code Remote-SSH picks up the `Host nao` alias automatically.
 
 ### Making the IP static
 
-Best path: file a ticket with Morgan IT giving them the NAO's WiFi MAC address (`ifconfig wlan0 | grep ether` on the robot) and request a DHCP reservation for `172.20.95.123`. That survives firmware updates and doesn't require touching the robot.
+Best path: file a ticket with Morgan IT giving them the NAO's WiFi MAC address (`ifconfig wlan0 | grep ether` on the robot) and request a DHCP reservation for `172.20.95.100`. That survives firmware updates and doesn't require touching the robot.
 
 Fallback: configure a fixed IP via Choregraphe (Settings → Network → "Use a fixed IP address") or via `connmanctl` on the robot directly.
 
@@ -177,8 +179,8 @@ source of confusion:
 
 | | Runs | Address | When |
 |---|---|---|---|
-| **NAO robot** | `nao/` (Python 2.7) | `172.20.95.123` | always |
-| **Raspberry Pi 4** | `server/` via systemd `nao-server` | `172.20.95.126` | production / demos |
+| **NAO robot** | `nao/` (Python 2.7) | `172.20.95.100` | always |
+| **Raspberry Pi 4** | `server/` via systemd `nao-server` | `172.20.95.123` | production / demos |
 | **Your laptop** | `server/` via `./run.sh` | your LAN IP | development |
 
 The Pi is the always-on brain so the robot works with nobody's laptop around
@@ -186,9 +188,11 @@ The Pi is the always-on brain so the robot works with nobody's laptop around
 
 - **Robot code** reaches the robot by **rsync** (`./run.sh`) — never git.
 - **Server code** reaches the Pi by **git push → Pi `git pull`** — never rsync.
-  The Pi's `origin` is **`github.com/lama9811/nao-sagecbt`** (repointed from a
-  collaborator's fork `theaayushstha1/...` on 2026-07-29; that fork's `main` was
-  stale). It tracks `main`, so push to `main` (`git push origin HEAD:main`) then
+  The Pi's `origin` is **`github.com/lama9811/NAO-CBT-ROBOT`** (moved there
+  2026-08-24 from `lama9811/nao-sagecbt`, which was itself repointed from a
+  collaborator's fork `theaayushstha1/...` on 2026-07-29. The `nao-sagecbt`
+  repo is now **gone** — it 404s — so NAO-CBT-ROBOT is the only remote copy of
+  the history; it carries all 319 commits). It tracks `main`, so push to `main` (`git push origin HEAD:main`) then
   `ssh naoserver 'cd ~/nao-sagecbt && git pull && sudo systemctl restart nao-server'`.
   **Auto-deploy is set up (2026-07-29):** a systemd timer `nao-autodeploy.timer`
   on the Pi runs `/home/nao/auto-deploy.sh` every 2 min — it `git fetch`es and,
@@ -214,10 +218,10 @@ Passwordless SSH key auth to the Pi is **set up and confirmed working**. Use:
 
 ```bash
 ssh naoserver               # key auth, no password (alias in ~/.ssh/config)
-ssh nao@172.20.95.126       # equivalent, explicit host
+ssh nao@172.20.95.123       # equivalent, explicit host
 ```
 
-`~/.ssh/config` has a `Host naoserver` block (`HostName 172.20.95.126`, `User
+`~/.ssh/config` has a `Host naoserver` block (`HostName 172.20.95.123`, `User
 nao`, `IdentityFile ~/.ssh/id_ed25519`). The same ed25519 key used for the robot
 is installed on the Pi. Runs Ubuntu 24.04.4 LTS (aarch64), Python 3.12.
 
@@ -443,7 +447,7 @@ the robot's face DB *and* upserts the `users` row (`_emit_motion` →
 - **Never diagnose reachability with `ping`.** The gateway and the robot
   ignore/drop ICMP; "100% packet loss" told us the robot was dead three times
   while SSH was wide open. Test the port you actually need:
-  `nc -z -G 4 172.20.95.123 22`.
+  `nc -z -G 4 172.20.95.100 22`.
 - **`main.py`'s structured logs are not in either obvious log file.** `logger.py`
   writes to a dated JSONL under `~/nao_assist/logs/` — so `boot_start`,
   `wake_engaged`, `boot_greeting_spoken` and friends appear in **none** of
