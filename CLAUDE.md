@@ -261,8 +261,15 @@ needed now that key auth works).
 
 **Robot → server pointing (updated 2026-07-29).** On power-up a Choregraphe
 `nao-therapy-autostart` behavior runs `/home/nao/launch_nao_assist.sh`, which
-now launches `main.py` with **`SERVER_IP=172.20.95.126`** hard-set — so the
-robot autostarts against the **Pi** and works with no laptop around. (Before,
+now **resolves `naoserver.local` by mDNS at launch** (5 attempts, 3s apart,
+falling back to the last-known `172.20.95.123`) and starts `main.py` against
+whatever it finds — so the robot autostarts against the **Pi** and survives a
+DHCP lease change without an edit. Before 2026-08-24 it hard-set
+`SERVER_IP=172.20.95.126`; when the Pi's lease moved to `.123`, the robot woke,
+greeted, and silently had nowhere to send audio. The robot resolves mDNS via
+`mdns4_minimal` in `/etc/nsswitch.conf`; `getent`/`avahi-resolve` do not exist
+on this firmware, so the launcher uses
+`python -c "import socket; socket.gethostbyname(...)"`. (Before,
 the launcher set no `SERVER_IP` and `main.py` fell back to `nao/config.py`'s
 stale default `172.20.95.106`, a dead host — the robot woke and silently did
 nothing. `nao/config.py:23` still defaults to `.106`; the launcher override is
