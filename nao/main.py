@@ -874,27 +874,39 @@ class _SessionController(object):
             return
 
         # Sound localizer — turns the head toward whoever just spoke.
-        try:
-            from sound_localize import SoundLocalizer
-            sl = SoundLocalizer(
-                nao_ip=config.NAO_IP,
-                nao_port=config.NAO_PORT,
-                max_yaw_deg=55.0,
-                max_pitch_deg=18.0,
-                turn_speed_dps=45.0,    # snappier than default 30 — feels alive
-                confidence_min=0.35,
-                auto_track=True,
-            )
-            sl.start()
-            self._sound_localizer = sl
-            self._log.info("sound_localizer_started")
-        except Exception as exc:
-            self._log.warn("sound_localizer_start_failed", error=str(exc))
-            self._sound_localizer = None
+        # SOUND_LOCALIZER=0 keeps the head still instead of swinging it
+        # toward every noise in the room.
+        self._sound_localizer = None
+        if os.environ.get("SOUND_LOCALIZER", "1").strip() == "0":
+            self._log.info("sound_localizer_disabled")
+        else:
+            # Sound localizer — turns the head toward whoever just spoke.
+            try:
+                from sound_localize import SoundLocalizer
+                sl = SoundLocalizer(
+                    nao_ip=config.NAO_IP,
+                    nao_port=config.NAO_PORT,
+                    max_yaw_deg=55.0,
+                    max_pitch_deg=18.0,
+                    turn_speed_dps=45.0,    # snappier than default 30 — feels alive
+                    confidence_min=0.35,
+                    auto_track=True,
+                )
+                sl.start()
+                self._sound_localizer = sl
+                self._log.info("sound_localizer_started")
+            except Exception as exc:
+                self._log.warn("sound_localizer_start_failed", error=str(exc))
+                self._sound_localizer = None
 
         # ALTracker face mode — keeps eyes on the closest face when no
         # recent sound event drives a re-aim. NAOqi's tracker handles
         # smoothing + reacquire on its own; we just turn it on.
+        # FACE_TRACKER=0 stops NAO following you with its camera.
+        if os.environ.get("FACE_TRACKER", "1").strip() == "0":
+            self._log.info("face_tracker_disabled")
+            self._face_tracker = None
+            return
         try:
             tracker = ALProxy("ALTracker", config.NAO_IP, config.NAO_PORT)
             try:

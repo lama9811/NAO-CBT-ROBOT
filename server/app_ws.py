@@ -46,6 +46,10 @@ from fastapi import (
 
 from server import breathing_pacing, config, memory, motion_trigger, openai_tts, safety
 from server import _legacy_helpers as legacy
+from server._legacy_helpers import (  # noqa: E402
+    _ECHO_MIN_CONTAIN_TOKENS,
+    _is_token_subsequence,
+)
 from server.tools import emotion as _emotion_module
 
 # Phase 11.8: ElevenLabs streaming TTS as primary path. Fallback to
@@ -742,8 +746,16 @@ def _is_substring_or_sentence_echo(username: str, transcript: str) -> bool:
         return False
 
     full = _LAST_REPLY_FULL.get(username, "").lower()
-    if full and nt in full:
-        return True
+    # Whole-token containment, not raw characters: a bare "no" must not match
+    # inside "now". Single- and two-word answers are left to the token-overlap
+    # pass below, which still catches a genuine short echo.
+    if full:
+        nt_seq = re.findall(r"[a-z0-9']+", nt)
+        full_seq = re.findall(r"[a-z0-9']+", full)
+        if nt_seq and (nt_seq == full_seq
+                       or (len(nt_seq) >= _ECHO_MIN_CONTAIN_TOKENS
+                           and _is_token_subsequence(nt_seq, full_seq))):
+            return True
 
     # Token-overlap against each individual sentence — protects against the
     # case where the transcript echoes one sentence but the joined string

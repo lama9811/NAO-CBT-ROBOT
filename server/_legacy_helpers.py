@@ -375,6 +375,21 @@ def _looks_like_hallucination(text: str, had_speech: bool = False) -> bool:
 LAST_REPLY: dict[str, str] = {}
 
 
+# Minimum whole-word length before *containment* alone marks a transcript as
+# echo. Below this, a short answer that happens to appear inside the last reply
+# ("no" within "now", "ok" within "okay") is far more likely to be the user
+# than the speaker bleeding into the mic.
+_ECHO_MIN_CONTAIN_TOKENS = 3
+
+
+def _is_token_subsequence(small: list[str], big: list[str]) -> bool:
+    """True if `small` appears as a run of consecutive tokens inside `big`."""
+    n = len(small)
+    if n == 0 or n > len(big):
+        return False
+    return any(big[i:i + n] == small for i in range(len(big) - n + 1))
+
+
 def _is_self_echo(username: str, transcript: str) -> bool:
     """Reject transcripts that look like our own previous reply (mic feedback)."""
     if not transcript:
@@ -386,10 +401,23 @@ def _is_self_echo(username: str, transcript: str) -> bool:
     nl = _norm(last)
     if not nt or not nl:
         return False
-    if nt in nl or nl in nt:
+    tt_seq = nt.split()
+    tl_seq = nl.split()
+    if tt_seq == tl_seq:
         return True
-    tt = set(nt.split())
-    tl = set(nl.split())
+    # Containment is checked on whole tokens, not raw characters. The old
+    # `nt in nl` matched "no" inside "now", so a user answering "No." to a
+    # reply containing "now" had their turn discarded as echo -- NAO ignoring
+    # short answers at random. Require _ECHO_MIN_CONTAIN_TOKENS real words
+    # before containment alone can condemn a turn; genuine one- and two-word
+    # echoes are still caught by the exact match above and the token overlap
+    # below.
+    if (min(len(tt_seq), len(tl_seq)) >= _ECHO_MIN_CONTAIN_TOKENS
+            and (_is_token_subsequence(tt_seq, tl_seq)
+                 or _is_token_subsequence(tl_seq, tt_seq))):
+        return True
+    tt = set(tt_seq)
+    tl = set(tl_seq)
     if not tt or not tl:
         return False
     inter = len(tt & tl)
