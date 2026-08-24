@@ -301,6 +301,14 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
 | `SPEAKING_GESTURES` | `1` | `0` stops arm micro-gestures during TTS. |
 | `BOOT_GREETING` | `1` | NAO says `BOOT_GREETING_TEXT` and waves once it's ready to talk (after mic/TTS/LEDs/wake gates are built, just before `wsm.start()`). Latched once per process so the crash-retry loop doesn't re-greet. `0` disables. |
 | `BOOT_GREETING_TEXT` | `Hello, I'm NAO. How can I help you?` | Reword without a code change. Spoken by **native** NAOqi TTS, which is unmuted and re-muted to 0.0 in a `finally` — if that restore ever breaks, the kid voice leaks into every ElevenLabs reply. |
+| `SOUND_LOCALIZER` | `1` | `0` stops NAO aiming its head at whoever just spoke. **Currently `0` on the robot.** `sound_localize.py` has no TTS gating, so while NAO talks its own speaker is the loudest source in the room and it turns to face itself — it looks away precisely while answering. Turning it off leaves the face tracker holding eye contact. The real fix is to gate it during TTS so off-axis speakers still get a head-turn. |
+| `FACE_TRACKER` | `1` | `0` stops ALTracker following a face with the camera. Left **on** — this is what keeps NAO looking at the user. |
+
+**The robot's launcher currently sets** `SPEAKING_GESTURES=0 BOOT_GREETING=0
+SOUND_LOCALIZER=0 FACE_TRACKER=1` (added 2026-08-24 on user request: no
+greeting/wave, still hands while talking, eyes on the user). These live only in
+`/home/nao/launch_nao_assist.sh` — **not in git**, so a reflash loses them.
+Backups on the robot: `launch_nao_assist.sh.bak.*`.
 
 **Mic gain is not adjustable and does not need to be** (measured 2026-07-30).
 `ALAudioDevice.setInputVolume` does not exist on this firmware — `_set_volume`
