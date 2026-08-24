@@ -372,6 +372,33 @@ EOU_HINT_CONFIRM_MS = int(os.environ.get("EOU_HINT_CONFIRM_MS", "150"))
 EOU_SEMANTIC_SILENCE_MS = int(os.environ.get("EOU_SEMANTIC_SILENCE_MS", "200"))
 EOU_HARD_CEILING_MS = int(os.environ.get("EOU_HARD_CEILING_MS", "60_000"))
 
+# Pre-roll window kept while no speech has been detected yet.
+#
+# `_ingest` buffers every inbound chunk, so a user who sits quietly before
+# answering used to get all of that silence prepended to their sentence — a
+# 53 s clip for one spoken line, which Deepgram's nova-3 returned empty on and
+# the nova-2 retry answered with background chatter. We keep a short tail so
+# the speech onset is never clipped, and drop everything older.
+EOU_PREROLL_MS = int(os.environ.get("EOU_PREROLL_MS", "500"))
+
+
+def _trim_preroll(buf: bytearray,
+                  sample_rate: int = 16000,
+                  sample_width: int = 2,
+                  channels: int = 1,
+                  preroll_ms: int | None = None) -> None:
+    """Drop all but the trailing `preroll_ms` of audio from `buf`, in place.
+
+    Called only while `had_speech` is False, so it can never discard speech
+    the arbiter is waiting on — by definition nothing here has been detected
+    as voice yet. Trimming in place keeps `sess.audio_buf`'s identity, which
+    the rest of the ingest path holds a reference to.
+    """
+    window_ms = EOU_PREROLL_MS if preroll_ms is None else preroll_ms
+    max_bytes = int(sample_rate * sample_width * channels * window_ms / 1000)
+    if max_bytes >= 0 and len(buf) > max_bytes:
+        del buf[:len(buf) - max_bytes]
+
 # Phase 2 — Post-TTS cooldown knob. Bytes received within
 # `(MIC_GATE_GRACE_MS + 400) ms` after the last audio_chunk are dropped as
 # echo. The 400 ms tail covers reverb that survives the robot's own mic
@@ -2545,6 +2572,11 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
                 # during talking and False during pauses; we just OR it in.
                 if not sess.had_speech and _silero_speaking(sess):
                     sess.had_speech = True
+                    # Speech onset is the real start of the utterance. Stamping
+                    # it here (rather than on the first chunk) makes the 60 s
+                    # hard ceiling measure 60 s of *talking*, so a user who
+                    # takes a while to begin is no longer cut off mid-sentence.
+                    sess.utterance_start_ms = now_ms
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "silero_feed_failed",
@@ -2552,6 +2584,13 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
                 )
                 # Don't drop the session; just retire the broken instance.
                 sess.silero = None
+
+        # Nothing has been detected as speech yet: keep only a short pre-roll
+        # so the onset survives, and let the silence fall off the front. Guarded
+        # on a live detector — with silero absent `had_speech` never flips, and
+        # trimming would eat the whole turn.
+        if sess.silero is not None and not sess.had_speech:
+            _trim_preroll(sess.audio_buf)
 
         # Arbiter check — may finalize the turn right here.
         await _finalize_turn_if_ready(ws, sess)
