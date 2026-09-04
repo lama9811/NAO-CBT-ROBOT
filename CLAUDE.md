@@ -130,14 +130,20 @@ Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morg
 
 ## NAO Robot — Connection
 
-- **IP:** `172.20.95.100` (confirmed 2026-08-24). **Do not trust this number** —
-  the lease moved `.127` → `.123` (2026-07-15 → 07-28), then `.123` → `.100` by
-  2026-08-24, when the **Pi took over the robot's old `.123`** — so a stale
-  `ssh nao` lands you on the Pi, and a stale `NAO_IP` makes `run.sh` rsync robot
-  code onto the server. The Pi moved `.126` → `.123` at the same time. Always resolve before use:
-  `dscacheutil -q host -a name nao.local | grep ip_address`, and update `NAO_IP`
-  in `.env` when it changes (`run.sh` reads it from there). See below for making
-  it static.
+- **IP: unknown — re-resolve every session.** `.100` was right on 2026-08-24 and
+  was already wrong by 2026-09-03. The lease has moved `.127` → `.123`
+  (2026-07-15 → 07-28), `.123` → `.100` (by 08-24, when the **Pi took over the
+  robot's old `.123`**), and off `.100` since. A stale `ssh nao` lands you on the
+  Pi, and a stale `NAO_IP` makes `run.sh` rsync Python 2.7 robot code onto the
+  server. Do not trust any number written here or in `.env`.
+- **Fastest way to get the real IP: press NAO's chest button once — it speaks its
+  own address aloud.** No network access needed, and it doubles as a power check:
+  silence means the robot is off or flat, which is its own answer. `dscacheutil -q
+  host -a name nao.local | grep ip_address` works only when mDNS is up (it was
+  not on 2026-09-03).
+- **Don't trust `.env`'s `NAO_IP` either.** On 2026-09-03 it read `172.20.95.101`,
+  which was a **WNC Corporation** device (a phone), not the robot — see the MAC
+  vendor trick under "Debugging the robot".
 - **Hostname:** `nao.local` (mDNS fallback)
 - **User:** `nao`
 - **Password:** stored in `.env` as `NAO_PASSWORD` (do NOT commit the password; `.env` is gitignored). Only needed for the initial key push — passwordless SSH is now configured (see below).
@@ -148,8 +154,8 @@ Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morg
 Passwordless key auth is **set up and confirmed working (2026-07-15)** — an ed25519 key (`~/.ssh/id_ed25519`) is installed on the robot and a `Host nao` alias is in `~/.ssh/config`. Just use:
 
 ```bash
-ssh nao                   # key auth, no password
-ssh nao@172.20.95.100     # equivalent, explicit host
+ssh nao                   # key auth, no password -- but see the warning below
+ssh nao@<current-ip>      # explicit host; get the IP from the chest button
 ssh nao@nao.local         # elsewhere, if mDNS resolves
 ```
 
@@ -157,16 +163,25 @@ ssh nao@nao.local         # elsewhere, if mDNS resolves
 
 ```
 Host nao
-  HostName 172.20.95.100
+  HostName <robot's current IP>    # STALE BY DEFAULT -- update on every lease move
   User nao
   IdentityFile ~/.ssh/id_ed25519
 ```
 
-To re-provision the key on a fresh machine: `ssh-copy-id nao@172.20.95.100` (uses `NAO_PASSWORD` from `.env` once). VS Code Remote-SSH picks up the `Host nao` alias automatically.
+**The `Host nao` alias pins a hard-coded `HostName`, so it goes stale exactly
+when the lease moves — and then `ssh nao` connects to whatever now owns that
+address.** On 2026-09-03 the alias still pointed at `.100` while the robot was
+elsewhere entirely. Worse, on 2026-08-24 the Pi had taken the robot's old
+`.123`, so `ssh nao` silently landed on the **server**. Re-check `HostName`
+against the robot's actual IP before trusting the alias, and never assume a
+successful `ssh nao` reached the robot — confirm with `hostname` (the robot is
+not `naoserver`).
+
+To re-provision the key on a fresh machine: `ssh-copy-id nao@<current-ip>` (uses `NAO_PASSWORD` from `.env` once). VS Code Remote-SSH picks up the `Host nao` alias automatically.
 
 ### Making the IP static
 
-Best path: file a ticket with Morgan IT giving them the NAO's WiFi MAC address (`ifconfig wlan0 | grep ether` on the robot) and request a DHCP reservation for `172.20.95.100`. That survives firmware updates and doesn't require touching the robot.
+Best path: file a ticket with Morgan IT giving them the NAO's WiFi MAC address (`ifconfig wlan0 | grep ether` on the robot) and request a DHCP reservation for the robot. That survives firmware updates and doesn't require touching the robot.
 
 Fallback: configure a fixed IP via Choregraphe (Settings → Network → "Use a fixed IP address") or via `connmanctl` on the robot directly.
 
@@ -179,7 +194,7 @@ source of confusion:
 
 | | Runs | Address | When |
 |---|---|---|---|
-| **NAO robot** | `nao/` (Python 2.7) | `172.20.95.100` | always |
+| **NAO robot** | `nao/` (Python 2.7) | *DHCP — ask the robot (chest button)* | always |
 | **Raspberry Pi 4** | `server/` via systemd `nao-server` | `172.20.95.123` | production / demos |
 | **Your laptop** | `server/` via `./run.sh` | your LAN IP | development |
 
@@ -188,6 +203,13 @@ The Pi is the always-on brain so the robot works with nobody's laptop around
 
 - **Robot code** reaches the robot by **rsync** (`./run.sh`) — never git.
 - **Server code** reaches the Pi by **git push → Pi `git pull`** — never rsync.
+  **There are two remotes and only one of them deploys.** The Pi pulls
+  `lama9811/NAO-CBT-ROBOT`; a second copy lives at `github.com/nasomv/NAO-CBT-ROBOT`
+  and is what a clone on the Mac may have as `origin`. Pushing to `nasomv`
+  deploys **nothing** — auto-deploy never sees it. On 2026-09-03 `nasomv/main`
+  was 6 commits behind (`c38e1a0` vs `875badb`, ~25 days) while looking healthy.
+  Check `git remote -v` before assuming a push shipped, and reconcile with
+  `git fetch https://github.com/lama9811/NAO-CBT-ROBOT.git main`.
   The Pi's `origin` is **`github.com/lama9811/NAO-CBT-ROBOT`** (moved there
   2026-08-24 from `lama9811/nao-sagecbt`, which was itself repointed from a
   collaborator's fork `theaayushstha1/...` on 2026-07-29. The `nao-sagecbt`
@@ -310,14 +332,33 @@ greeting/wave, still hands while talking, eyes on the user). These live only in
 `/home/nao/launch_nao_assist.sh` — **not in git**, so a reflash loses them.
 Backups on the robot: `launch_nao_assist.sh.bak.*`.
 
-**Mic gain is not adjustable and does not need to be** (measured 2026-07-30).
-`ALAudioDevice.setInputVolume` does not exist on this firmware — `_set_volume`
-logs `Can't find method: setInputVolume` at every boot and moves on. That is
-cosmetic: the ALSA `Capture` control already sits at **153900/65536 ≈ 235%**,
-above nominal max, so there is no headroom to add. Speech scaled to the robot's
-real capture level and mixed with its own recorded room noise transcribes
-perfectly on nova-3, and normalising or high-pass filtering it changed
-Deepgram's output not at all. Don't "fix" the mic gain — measure first.
+**Mic capture gain IS adjustable, is not persistent, and has already failed
+once** (2026-09-04). `ALAudioDevice.setInputVolume` does not exist on this
+firmware — that part of the old note stands, and the `Can't find method`
+line at boot is cosmetic. But the ALSA controls `Numeric Left mics` /
+`Numeric Right mics` (range 0-88, 0.5 dB per step, 24 = 0.00 dB) do work,
+they are **not persisted across reboot**, and on 2026-09-04 they were found
+at **24/88 = 0.00 dB**. The effect: measured capture RMS **421** against a
+speech baseline of ~**10000**, so Deepgram returned empty on every single
+turn and NAO heard nothing — while every log looked healthy and the key,
+model and network all tested fine. Restore with:
+
+```bash
+ssh nao 'amixer -c 0 sset "Numeric Left mics" 75; amixer -c 0 sset "Numeric Right mics" 75'   # +25.50 dB
+```
+
+**Gain is applied when the capture stream OPENS**, so setting it while
+`main.py` runs changes nothing until the process restarts — that cost an
+hour on 2026-09-04 when the mixer read 75 and the audio was still silent.
+The launcher now restores it on every boot, but
+`/home/nao/launch_nao_assist.sh` **is not in git**, so a reflash loses it
+again. Backup: `launch_nao_assist.sh.bak.20260904`.
+
+Diagnose by measuring, not guessing: copy
+`/home/nao/recordings/_stream/stream.wav` off the robot and check per-second
+RMS. Speech is ~10000; a flat ~400 floor is a dead mic, not a quiet room.
+The old advice — "don't fix the mic gain, measure first" — was right about
+measuring and wrong that there is nothing to fix.
 
 ### Server-side gotchas
 
@@ -338,11 +379,23 @@ Deepgram's output not at all. Don't "fix" the mic gain — measure first.
   pause. `_synth_for` normalizes before any provider sees the text. It only
   removes formatting — it never rewrites, reorders, or summarizes — and leaves
   standalone `*` alone so "2 * 3" still reads as arithmetic.
-- **`FFMPEG_BIN`** must point at a real ffmpeg or `OPENAI_TTS_GAIN_DB` is
-  *silently skipped* and NAO is barely audible. No Homebrew on this Mac; ffmpeg
-  lives in a conda env. Check `logs/server.log` for `ffmpeg unavailable`.
-- `run.sh` pins `.venv/bin/python`. A bare `python` resolves to miniconda,
-  which lacks the deps — the server dies at import on `structlog`.
+- **`FFMPEG_BIN`** must point at a real ffmpeg or `OPENAI_TTS_GAIN_DB` /
+  `ELEVENLABS_TTS_GAIN_DB` are *silently skipped* and NAO is barely audible.
+  No Homebrew on this Mac; the path in `.env`
+  (`/opt/miniconda3/envs/nao-sagecbt/bin/ffmpeg`) is from a machine that had
+  conda. **Verified absent on this Mac 2026-09-03** — no conda, no ffmpeg on
+  PATH — so that value is dead here. Check `logs/server.log` for
+  `ffmpeg unavailable`, and `[ -x "$FFMPEG_BIN" ]` before trusting it.
+- **The Mac's `.venv` was rebuilt 2026-09-03** and now imports the server
+  cleanly (`from server import app_ws`). Before that there was no `.venv` and no
+  conda, so `run.sh` — which pins `.venv/bin/python` — could not start at all.
+  The **system** `python3` still lacks `dotenv`/`fastapi`/`agents`: always go
+  through `.venv/bin/python`, including for pytest, or you get
+  `No module named 'fastapi'` and conclude the tree is broken when it isn't.
+  `requirements.txt` now pins `openai-agents==0.13.6` + `openai<3` on purpose:
+  the old `>=0.0.5` resolves to 0.22.0, which wants `openai>=3`, which litellm
+  forbids — and the loser is `litellm`, so every `claude-*` model silently
+  degrades to OpenAI at import.
 - `USE_DEEPGRAM=1` / `USE_ELEVENLABS_TTS=1` in `.env` are **no-ops** without
   their keys/voice IDs — everything falls through to OpenAI. Docs record that
   Deepgram was benchmarked and rejected (slow on the CS network).
@@ -380,6 +433,42 @@ Deepgram's output not at all. Don't "fix" the mic gain — measure first.
   `SAGE_TOPOLOGY=passthrough`** (the default). They configure
   `topologies/safety_agent.py`, which only runs under the SAGE research
   topologies. The live gate is `safety.py` + `CRISIS_MODEL`.
+
+### API keys — the failure that looks like a broken robot
+
+**Check which slot each key is in before debugging anything else.** On
+2026-09-03 the robot "stopped responding" because the **ElevenLabs key had been
+pasted into `OPENAI_API_KEY`**, and the real OpenAI key was absent. Nothing in
+the logs says "wrong variable" — you get `invalid_api_key` from OpenAI and a
+silent fallback everywhere else.
+
+Tell the keys apart by prefix:
+
+| Provider | Prefix | Note |
+|---|---|---|
+| OpenAI | `sk-` / `sk-proj-` | **hyphen** |
+| ElevenLabs | `sk_` | **underscore** — this is the one that gets mis-pasted |
+| Anthropic | `sk-ant-api03-` | |
+| Deepgram | 40 hex chars, no prefix | |
+
+Why one swapped key killed the whole robot: every agent pointed at OpenAI
+models, so the brain 401'd on every turn; and `ELEVENLABS_API_KEY` being empty
+sent TTS to the OpenAI fallback, which 401'd too. Deepgram still worked, so
+**NAO heard you and then went silent** — the exact symptom. Verify keys against
+the live endpoints rather than trusting the file; a 401 body names the provider
+that rejected it.
+
+**A valid ElevenLabs key is not enough — a voice ID is also required.**
+`elevenlabs_tts.is_available()` (`server/elevenlabs_tts.py`) returns `False`
+when `_resolve_default_voice_id()` is empty, so with `ELEVENLABS_VOICE_GIRL`
+unset the whole provider is skipped and TTS silently falls back to OpenAI. Keys
+are also permission-scoped: a key without `voices_read` **cannot list voices**
+(401), so you cannot discover an ID from the API — the working IDs are recorded
+in `.env`, and losing them means losing the voice.
+
+`OPENAI_AGENTS_TRACE=1` uploads traces to OpenAI on every turn. With a dead or
+absent OpenAI key that is a wasted round-trip per turn; set it to `0` on any
+deploy not using OpenAI.
 
 ### Known bugs
 
@@ -462,7 +551,38 @@ the robot's face DB *and* upserts the `users` row (`_emit_motion` →
 - **Never diagnose reachability with `ping`.** The gateway and the robot
   ignore/drop ICMP; "100% packet loss" told us the robot was dead three times
   while SSH was wide open. Test the port you actually need:
-  `nc -z -G 4 172.20.95.100 22`.
+  `nc -z -G 4 <ip> 22`.
+- **Read the *failure mode*, not just "it didn't connect."** The three outcomes
+  mean completely different things and point at different fixes:
+
+  | Result | Meaning | Where the fault is |
+  |---|---|---|
+  | `Connection refused` | Packet arrived, host sent RST | **Host is UP**; no service listening |
+  | timeout / no route | Nothing came back | Host off, wrong IP, or network blocking |
+  | ARP `(incomplete)` | No L2 reply | Not on this subnet at all |
+
+  A refusal is a *reply* — it proves the host is alive and the network path is
+  clean in both directions, which rules out firewalls, client isolation, VLANs
+  and wrong IPs in one shot. `arp -a | grep -v incomplete` lists what is
+  genuinely on the subnet.
+- **Identify an unknown device by its MAC vendor before trusting an IP.**
+  `curl -s https://api.macvendors.com/<mac>` — the Pi returns *Raspberry Pi
+  Trading Ltd*, and NAO returns Aldebaran/SoftBank. On 2026-09-03 `.env`'s
+  `NAO_IP=172.20.95.101` resolved to a **WNC Corporation** device (a phone) that
+  had taken the robot's old lease. Randomised MACs (locally-administered, second
+  hex digit `2`/`6`/`a`/`e`) are phones and laptops, never the robot or the Pi.
+- **Zero open ports on a live host = booted, but userspace never started.**
+  On 2026-09-03 the Pi answered ARP and refused every one of ports 1-1024 plus
+  the usual alternates — kernel and networking up, **not one service running**,
+  including `sshd` and `nao-server`. A healthy box always has something
+  listening, so this is not an SSH problem and no remote fix exists: there is no
+  door open. It needs console access (monitor + keyboard) or the SD card in a
+  Mac. Diagnose at the console with `systemctl --failed`,
+  `systemctl status ssh.socket nao-server`, and `mount | grep ' / '` — a root
+  filesystem mounted `ro` means SD-card damage (usually an unclean power-off),
+  and the fix is card recovery, **not** restarting services. Remember Ubuntu
+  uses socket activation: start `ssh.socket`, not `ssh.service`, and
+  `enable --now` it or it will not survive the next reboot.
 - **`main.py`'s structured logs are not in either obvious log file.** `logger.py`
   writes to a dated JSONL under `~/nao_assist/logs/` — so `boot_start`,
   `wake_engaged`, `boot_greeting_spoken` and friends appear in **none** of

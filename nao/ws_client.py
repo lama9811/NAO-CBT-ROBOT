@@ -162,12 +162,22 @@ def _backoff_schedule():
 # docs/PHASE_1_TASK_MAP.md. Server parses by string match.
 # ---------------------------------------------------------------------------
 
-def _audio_chunk_frame(seq, ts_ms, b64_pcm):
+def _audio_chunk_frame(seq, ts_ms, b64_pcm, speaking=False):
+    """Build an outbound mic frame.
+
+    ``speaking`` reports whether NAO's own speaker was live when this audio
+    was captured. Only the robot knows that: the server finishes *sending*
+    MP3 chunks long before the robot finishes *playing* them, so a
+    server-side timer is stale for exactly the window in which a user would
+    say "mute". Tagging the frame lets the server route mid-speech audio to
+    the mute listener instead of the turn pipeline.
+    """
     return {
         "type": "audio_chunk",
         "seq": int(seq),
         "ts_ms": float(ts_ms),
         "data": b64_pcm,
+        "speaking": bool(speaking),
     }
 
 
@@ -244,6 +254,14 @@ class NaoWsClient(object):
         # so we react to server intent even before the first MP3 hits the
         # ALAudioPlayer queue.
         self._tts_active = threading.Event()
+        # Spoken-mute state, mirrored from the server so the robot can cut
+        # already-queued audio locally instead of waiting for the server to
+        # stop sending it.
+        self._muted = False
+        # Keep the mic live while NAO speaks so "mute" can be heard at all.
+        self._mute_listen_during_tts = (
+            os.environ.get("MUTE_LISTEN_DURING_TTS", "1") == "1"
+        )
 
         # Track the latest scheduled mic-gate-open timer so a back-to-back
         # tts_ended can cancel the prior one. Otherwise the "open mic in
@@ -733,6 +751,10 @@ class NaoWsClient(object):
             self._on_tts_started(data)
         elif sub == "tts_ended":
             self._on_tts_ended(data)
+        elif sub == "mute":
+            self._on_mute(data)
+        elif sub == "unmute":
+            self._on_unmute(data)
         elif sub == "crisis_lock":
             self._on_crisis_lock(data)
         elif sub == "brain_sync":
@@ -877,13 +899,78 @@ class NaoWsClient(object):
         paths, so hanging mic safety on that frame alone left the gate
         open through onboarding TTS — NAO transcribed its own voice and
         looped. `gate()` is idempotent, so calling this per chunk is safe.
+
+        MUTE_LISTEN_DURING_TTS=1 leaves the mic OPEN instead, which is what
+        makes the spoken "mute" command possible — `gate(True)` calls
+        `unsubscribe()` on the audio device, so with the gate closed NAO is
+        deaf while speaking and no command can reach it. The audio captured
+        in this window is *only* used for mute-word matching server-side
+        (see `_feed_mute_listener`); it never becomes a turn, so the
+        self-echo loop this gate was built to prevent still cannot form.
+        Set to 0 to restore the old deaf-while-speaking behaviour.
         """
         self._cancel_pending_mic_open()
+        if self._mute_listen_during_tts:
+            self.log.debug("mic_gate_left_open_for_mute_listen")
+            return
         try:
             if self.audio_streamer is not None:
                 self.audio_streamer.gate(True)  # close mic
         except Exception as exc:
             self.log.error("mic_gate_close_failed", error=str(exc))
+
+    # --- spoken mute / unmute ---
+    def _on_mute(self, data):
+        """Stop speaking now and stay quiet until unmuted.
+
+        The reply being spoken was synthesized before the command was
+        recognized, so several MP3 chunks are usually already queued in
+        the player. Stopping the player is what actually makes NAO go
+        quiet -- the server suppressing *future* chunks is not enough.
+        """
+        self._muted = True
+        try:
+            if self.tts_player is not None:
+                self.tts_player.stop()
+        except Exception as exc:
+            self.log.error("mute_tts_stop_failed", error=str(exc))
+        # Kill filler ("Hmm, one sec") too -- it is separate from the
+        # reply audio and would keep talking after the reply stopped.
+        try:
+            if self._announcer is not None:
+                self._announcer.stop(interrupt=True)
+                self._announcer_active = False
+            self._announcer_stop_all()
+        except Exception:
+            pass
+        # And the arm gestures, so NAO isn't left waving in silence.
+        try:
+            self._stop_speaking_gestures()
+        except Exception:
+            pass
+        self.log.info("muted")
+
+    def _is_speaking_now(self):
+        """True while NAO's own speaker is live.
+
+        Prefers the player's real queue state and falls back to the
+        server-driven `_tts_active` flag, mirroring what the barge-in loop
+        already does. Never raises -- this runs on the hot mic-send path.
+        """
+        try:
+            is_playing = getattr(self.tts_player, "is_playing", None)
+            if is_playing is not None and is_playing():
+                return True
+        except Exception:
+            pass
+        try:
+            return self._tts_active.is_set()
+        except Exception:
+            return False
+
+    def _on_unmute(self, data):
+        self._muted = False
+        self.log.info("unmuted")
 
     def _on_tts_started(self, data):
         self._tts_active.set()
@@ -1912,7 +1999,9 @@ class NaoWsClient(object):
             print("[mic_trace] ws_audio_chunk_sent count={0}".format(
                 self._audio_send_count))
             _sys.stderr.flush()
-        return self._send_json(ws, _audio_chunk_frame(seq, ts_ms, b64_pcm))
+        return self._send_json(
+            ws, _audio_chunk_frame(seq, ts_ms, b64_pcm,
+                                   speaking=self._is_speaking_now()))
 
     @staticmethod
     def _unpack_chunk(chunk):

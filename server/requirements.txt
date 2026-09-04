@@ -1,5 +1,23 @@
-openai-agents>=0.0.5
-openai>=1.50.0
+# Pinned, not >=. `openai-agents>=0.0.5` resolves to 0.22.0, which requires
+# openai>=3 -- and litellm (below) still pins openai<3, so the two cannot be
+# installed together. A fresh venv built from the loose pin ends up with the
+# Claude models silently unavailable ("litellm unavailable, cannot use
+# Anthropic model ..." at import) and every agent falling back to OpenAI.
+# 0.13.6 is the version this code was developed against.
+openai-agents>=0.13.6,<0.18
+# Upper-bounded, not pinned. A newer `openai` makes `cache_write_tokens` a
+# REQUIRED field on `InputTokensDetails` while openai-agents builds that model
+# without it, so every agent turn dies mid-stream on a pydantic
+# ValidationError -- and the turn still logs `outcome=ok` with an empty reply,
+# so Nao just goes silent and nothing looks broken. Confirmed broken on
+# 2.54.0; confirmed good on 2.26.0 (Mac) and 2.36.0 (Pi, in production), which
+# are the two endpoints of this range. Bites Claude turns too: LitellmModel
+# still normalizes usage through OpenAI's types.
+#
+# Ranges rather than == on purpose: the Mac runs 2.26.0/0.13.6 and the Pi runs
+# 2.36.0/0.17.1, both working. An exact pin would silently downgrade whichever
+# machine did not match next time its venv was rebuilt.
+openai>=2.26.0,<2.37
 google-cloud-discoveryengine>=0.13.0
 # Legacy Flask transport (kept under USE_WS=0 for the deployment-week per PRD v2)
 flask==3.0.3
@@ -33,6 +51,11 @@ pytest-flask==1.3.0
 # SAGE-CBT optional: SafetyAgent Claude provider (SAGE_SAFETY_PROVIDER=claude).
 # Not required for the default OpenAI-only path; imported lazily.
 anthropic>=0.40.0 ; python_version >= "3.10"
+# REQUIRED for the Claude stack, despite reading as optional: model_factory
+# wraps every `claude-*` model id in LitellmModel, and without this the wrap
+# raises at import and each agent degrades to OpenAI. The brain is Claude by
+# default (see server/config.py), so omitting this breaks the default install.
+litellm>=1.99.0
 
 # Phase 10.5 — Virtual NAO simulator (Mac-side). Optional; only needed
 # to run sim/live_nao.py interactively. Headless scenarios + e2e tests

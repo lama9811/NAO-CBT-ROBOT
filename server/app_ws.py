@@ -44,7 +44,7 @@ from fastapi import (
     status,
 )
 
-from server import breathing_pacing, config, memory, motion_trigger, openai_tts, safety
+from server import breathing_pacing, config, memory, motion_trigger, mute_words, openai_tts, safety
 from server import _legacy_helpers as legacy
 from server._legacy_helpers import (  # noqa: E402
     _ECHO_MIN_CONTAIN_TOKENS,
@@ -689,6 +689,37 @@ def _build_returning_greeting(display_name: str | None,
 
 _LAST_REPLY_CHUNKS: dict[str, list[str]] = {}
 _LAST_REPLY_FULL: dict[str, str] = {}
+
+
+def _rebind_username(sess: "_Session", new_username: str) -> None:
+    """Rename a live session, carrying its echo state across.
+
+    The echo stores are keyed by username, and a session gets renamed
+    mid-conversation as soon as a face is recognised or a name is learned
+    (`guest` -> `mia`). Without migrating the stores, everything Nao has
+    already said is orphaned under the old key and the very next inbound
+    turn finds an empty history -- so Nao's own voice sails through the
+    echo guard exactly once.
+
+    That is not hypothetical: on 2026-09-04 the camera announcement
+    ("...say 'stop watching me' anytime") was stored under `guest`, the
+    session was rebound to a learned name, and the echoed announcement then
+    matched the `disable_camera` motion trigger. Nao switched its own
+    camera off by hearing itself.
+    """
+    old = sess.username
+    new = (new_username or "").strip().lower()
+    if not new or new == old:
+        return
+    for store in (_LAST_REPLY_CHUNKS, _LAST_REPLY_FULL):
+        if old in store:
+            store[new] = store.pop(old)
+    try:
+        if old in legacy.LAST_REPLY:
+            legacy.LAST_REPLY[new] = legacy.LAST_REPLY.pop(old)
+    except Exception:  # noqa: BLE001 -- never break a rename over bookkeeping
+        pass
+    sess.username = new
 _REPLY_CHUNKS_MAX = 8
 
 
@@ -726,6 +757,66 @@ def _reset_reply_chunks(username: str, full_reply: str) -> None:
         return
     _LAST_REPLY_CHUNKS[username] = [text]
     _LAST_REPLY_FULL[username] = text
+
+
+# Nao's fixed spoken lines. These are never valid user input, so a
+# transcript that matches one is Nao hearing itself -- no matter whose
+# session it is, what it said last turn, or whether the echo stores got
+# orphaned by a rename.
+#
+# This exists because the per-turn echo guard is state-dependent and
+# therefore fallible: on 2026-09-04 the camera announcement slipped past it
+# and, because that announcement literally contains the words "say stop
+# watching me anytime", matched the `disable_camera` trigger. Nao switched
+# its own camera off. A stateless check on known lines closes that class of
+# failure rather than the one instance.
+_SYSTEM_LINE_MIN_TOKENS = 5
+_SYSTEM_LINE_OVERLAP = 0.75
+_SYSTEM_LINE_CACHE: list[set[str]] | None = None
+
+
+def _system_spoken_lines() -> list[set[str]]:
+    """Token sets for every canned line Nao can speak. Built once, lazily.
+
+    Lazy because several of these constants are defined further down the
+    module; resolving them at call time avoids an import-order dependency.
+    """
+    global _SYSTEM_LINE_CACHE
+    if _SYSTEM_LINE_CACHE is None:
+        out: list[set[str]] = []
+        for src in (
+            getattr(config, "CAMERA_ANNOUNCE_TEXT", ""),
+            globals().get("_CAMERA_ANNOUNCE_FALLBACK", ""),
+            globals().get("_ONBOARDING_NAME_PROMPT", ""),
+            globals().get("_ONBOARDING_NAME_RETRY", ""),
+            globals().get("_ONBOARDING_GREETING", ""),
+            getattr(safety, "HOTLINE_REPLY", ""),
+        ):
+            toks = set(re.findall(r"[a-z0-9']+", str(src or "").lower()))
+            if len(toks) >= _SYSTEM_LINE_MIN_TOKENS:
+                out.append(toks)
+        _SYSTEM_LINE_CACHE = out
+    return _SYSTEM_LINE_CACHE
+
+
+def _is_system_line_echo(transcript: str) -> bool:
+    """True when the transcript is one of Nao's own canned lines.
+
+    Requires at least `_SYSTEM_LINE_MIN_TOKENS` words before it will fire.
+    Without that floor a short genuine command ("camera on") would overlap
+    a long announcement completely and be thrown away -- the guard would
+    start eating the very instructions the announcement is telling people
+    to say.
+    """
+    toks = set(re.findall(r"[a-z0-9']+", (transcript or "").lower()))
+    if len(toks) < _SYSTEM_LINE_MIN_TOKENS:
+        return False
+    for line in _system_spoken_lines():
+        # Fraction of the *transcript* covered by the canned line, so a long
+        # canned line cannot swallow a short utterance by sheer size.
+        if len(toks & line) / float(len(toks)) >= _SYSTEM_LINE_OVERLAP:
+            return True
+    return False
 
 
 def _is_substring_or_sentence_echo(username: str, transcript: str) -> bool:
@@ -965,6 +1056,38 @@ async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
         logging.getLogger("sage.app_ws").warning("send_json failed: %s", e)
 
 
+async def _send_audio_chunk(ws: WebSocket, sess: "_Session",
+                            frame: dict[str, Any],
+                            force: bool = False) -> bool:
+    """Send one audio_chunk unless the session is muted.
+
+    Every outbound-speech path funnels through here so "mute" cannot be
+    defeated by whichever reply path happens to run (crisis, motion ack,
+    onboarding, streamed agent reply...). Returns False when suppressed.
+
+    The turn still runs while muted -- NAO listens, thinks, and records
+    memory as normal. Only the audio is withheld, so an "unmute" lands
+    mid-conversation rather than after a reset.
+
+    `force=True` speaks regardless of mute. It exists for the crisis
+    hotline reply only: `safety.crisis_check` runs before the agent and
+    cannot be overridden by design, and a spoken "mute" must not be able
+    to silence a 988 referral. Do not use it for ordinary replies.
+    """
+    if getattr(sess, "muted", False) and not force:
+        logger.info(
+            "tts_suppressed_muted",
+            user=sess.username, session_id=sess.session_id,
+            text_preview=str(frame.get("text") or "")[:80],
+        )
+        return False
+    # Remember what NAO is saying so the mute matcher can tell the user's
+    # voice from NAO's own, heard through the mic left open during TTS.
+    sess.speaking_text = str(frame.get("text") or "")
+    await _send_json(ws, frame)
+    return True
+
+
 def _audio_chunk_frame(
     seq: int,
     text: str,
@@ -987,6 +1110,155 @@ def _action_frame(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 def _control_frame(subtype: str, **data: Any) -> dict[str, Any]:
     return {"type": "control", "subtype": subtype, "data": data}
+
+
+# ───────── spoken mute / unmute ─────────
+
+# 16 kHz mono s16 = 32000 B/s. 1.2 s is enough for "Nao mute" and keeps the
+# perceived cut-off quick: the user waits this window PLUS an STT round trip
+# (~0.5 s) before Nao goes quiet, so every 100 ms here is felt.
+_MUTE_WINDOW_BYTES = 38400
+
+# Carry this much audio over into the next window. Without an overlap a
+# command landing on a window boundary is split in half -- "nao" in one
+# window, "mute" in the next -- and neither half matches. 0.6 s comfortably
+# spans a two-word command.
+_MUTE_WINDOW_OVERLAP_BYTES = 19200
+# Hard cap so a long reply can't grow this without bound if the checks
+# fall behind.
+_MUTE_BUF_MAX_BYTES = _MUTE_WINDOW_BYTES * 3
+
+MUTE_LISTEN_ENABLED = os.environ.get("MUTE_LISTEN_ENABLED", "1") == "1"
+
+
+async def _feed_mute_listener(ws: WebSocket, sess: "_Session",
+                              pcm: bytes) -> None:
+    """Collect speech heard while NAO talks and look for "mute" in it.
+
+    This is the side channel that makes the spoken command work. Audio
+    arriving during TTS is dropped by the main path on purpose (it is
+    mostly NAO's own voice, and feeding it to the turn pipeline creates a
+    self-conversation loop). Rather than weaken that, we copy it here and
+    run *only* the keyword matcher over it. Nothing from this buffer can
+    become a turn, reach an agent, or be written to memory.
+
+    Runs at most one STT call at a time per session; audio that arrives
+    while a check is in flight simply accumulates for the next window.
+    """
+    if not MUTE_LISTEN_ENABLED or sess.muted:
+        # When already muted NAO isn't speaking, so "unmute" arrives
+        # through the ordinary transcript path -- no side channel needed.
+        return
+
+    sess.mute_buf.extend(pcm)
+    if len(sess.mute_buf) > _MUTE_BUF_MAX_BYTES:
+        # Keep the most recent audio; the command is whatever was said last.
+        del sess.mute_buf[:-_MUTE_BUF_MAX_BYTES]
+    if len(sess.mute_buf) < _MUTE_WINDOW_BYTES or sess._mute_check_running:
+        return
+
+    window = bytes(sess.mute_buf)
+    # Keep a tail rather than clearing: see _MUTE_WINDOW_OVERLAP_BYTES.
+    del sess.mute_buf[:-_MUTE_WINDOW_OVERLAP_BYTES]
+    sess._mute_check_running = True
+
+    async def _check() -> None:
+        wav_path = None
+        try:
+            wav_path = _write_pcm_to_wav(window)
+            if not legacy.has_voice(wav_path):
+                return
+            text = await asyncio.to_thread(legacy.transcribe, wav_path)
+            if not text:
+                return
+            command = mute_words.classify_with_echo(
+                text, sess.speaking_text)
+            if command is None:
+                # Logged so a silent listener is diagnosable. Previously a
+                # listener that never fired produced no hits AND no errors,
+                # which is indistinguishable from one that never ran.
+                logger.debug(
+                    "mute_listener_no_match",
+                    user=sess.username, session_id=sess.session_id,
+                    heard=text[:80],
+                )
+                return
+            logger.info(
+                "mute_listener_hit",
+                user=sess.username, session_id=sess.session_id,
+                command=command, transcript=text[:80],
+            )
+            await _handle_mute_command(ws, sess, text)
+        except Exception as exc:  # noqa: BLE001 — never break the turn loop
+            logger.warning(
+                "mute_listener_error",
+                user=sess.username, error=repr(exc),
+            )
+        finally:
+            sess._mute_check_running = False
+            if wav_path:
+                try:
+                    os.unlink(wav_path)
+                except OSError:
+                    pass
+
+    asyncio.create_task(_check())
+
+
+
+
+async def _handle_mute_command(ws: WebSocket, sess: "_Session",
+                               transcript: str) -> bool:
+    """Act on a spoken "mute"/"unmute" and report whether we consumed it.
+
+    Runs *before* the reject filters, because the commands are one or two
+    words and `transcript_reject_reason` drops utterances that short as
+    noise -- checking afterwards would mean the command never arrives.
+
+    Returns True when the transcript was a mute command (the caller must
+    then stop processing it as ordinary speech).
+    """
+    # Match against the transcript minus whatever Nao just said. The open
+    # mic means a spoken command routinely arrives glued to the tail of
+    # Nao's own echoed reply -- one long transcript that the four-word cap
+    # in `classify` rejects outright. See `strip_leading_echo`.
+    echo_source = _LAST_REPLY_FULL.get(sess.username, "") or sess.speaking_text
+    command = mute_words.classify_with_echo(transcript, echo_source)
+    if command is None:
+        return False
+
+    # NAO hears itself: the mic stays open during TTS so it can catch
+    # "mute", which means its own voice comes back through STT. If the
+    # sentence it is speaking right now contains the word, this is an
+    # echo, not the user.
+    if mute_words.is_self_trigger(command, sess.speaking_text):
+        logger.info(
+            "mute_command_self_echo_ignored",
+            user=sess.username, session_id=sess.session_id,
+            command=command, transcript=(transcript or "")[:80],
+        )
+        return True
+
+    was_muted = sess.muted
+    sess.muted = (command == "mute")
+
+    logger.info(
+        "mute_command",
+        user=sess.username, session_id=sess.session_id,
+        command=command, was_muted=was_muted, now_muted=sess.muted,
+        transcript=(transcript or "")[:80],
+    )
+
+    # Tell the robot immediately so it can cut audio already queued in its
+    # player -- the reply it is speaking was synthesized before the command
+    # arrived and would otherwise run to completion.
+    await _send_json(ws, _control_frame(
+        command, muted=sess.muted,
+    ))
+    await _send_json(ws, _control_frame(
+        "transcript", transcript=transcript, reject_reason="mute_command",
+    ))
+    return True
 
 
 # ───────── per-session state ─────────
@@ -1024,6 +1296,18 @@ class _Session:
         # here rather than only in user_prefs so an anonymous session can
         # switch voices without pinning the choice on the shared `guest` row.
         "voice_profile_override",
+        # Spoken mute. `muted` survives across turns until the user says
+        # "unmute" -- NAO keeps listening and thinking, it just sends no
+        # audio. `speaking_text` is whatever NAO is saying right now, kept
+        # so a reply containing the word "mute" cannot mute the robot when
+        # it hears itself through the open mic.
+        "muted", "speaking_text",
+        # Latches the one-time wake greeting so a re-wake mid-session does
+        # not make Nao introduce itself again.
+        "greeted",
+        # Side-channel buffer for audio captured while NAO is speaking.
+        # Never becomes a turn -- only checked for the mute keyword.
+        "mute_buf", "_mute_check_running",
     )
 
     def __init__(self, username: str) -> None:
@@ -1038,6 +1322,11 @@ class _Session:
         self.turn_idx = 0
         self.out_seq = 0  # monotonic seq for outgoing audio_chunk frames
         self.voice_profile_override: str | None = None
+        self.muted: bool = False
+        self.speaking_text: str = ""
+        self.greeted: bool = False
+        self.mute_buf = bytearray()
+        self._mute_check_running: bool = False
 
         # Phase 2: server-side streaming Silero (set lazily on first audio
         # chunk so a missing dependency at import time doesn't kill the
@@ -1298,9 +1587,10 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
     # we hand audio to the client — the next inbound transcript may echo it.
     _reset_reply_chunks(sess.username, safety.HOTLINE_REPLY)
     if mp3:
-        await _send_json(
-            ws,
-            _audio_chunk_frame(sess.next_seq(), safety.HOTLINE_REPLY, mp3),
+        # Safety reply: speaks even when muted. See _send_audio_chunk.
+        await _send_audio_chunk(
+            ws, sess, _audio_chunk_frame(sess.next_seq(), safety.HOTLINE_REPLY, mp3),
+            force=True,
         )
     legacy.LAST_REPLY[sess.username] = safety.HOTLINE_REPLY
     _arm_post_tts_cooldown(sess)
@@ -1387,7 +1677,7 @@ async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
             if learned:
                 try:
                     await asyncio.to_thread(memory.ensure_user, learned, learned)
-                    sess.username = learned.strip().lower()
+                    _rebind_username(sess, learned)
                     sess.asking_name = False
                     sess.onboarding_retries = 0
                 except Exception as exc:  # noqa: BLE001
@@ -1406,9 +1696,8 @@ async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
             sess.voice_profile_override)
     _reset_reply_chunks(sess.username, motion.ack)
     if mp3:
-        await _send_json(
-            ws,
-            _audio_chunk_frame(sess.next_seq(), motion.ack, mp3),
+        await _send_audio_chunk(
+            ws, sess, _audio_chunk_frame(sess.next_seq(), motion.ack, mp3),
         )
     legacy.LAST_REPLY[sess.username] = motion.ack
     _arm_post_tts_cooldown(sess)
@@ -1424,6 +1713,22 @@ async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
 
 
 _ONBOARDING_NAME_PROMPT = "Hi, I'm NAO. What should I call you?"
+
+# What an unknown face hears on wake. Nao introduces itself and then just
+# answers -- it does not interrogate the visitor for a name first. Asking
+# first meant anyone who opened with a question got the question ignored
+# and the name prompt repeated at them instead.
+_ONBOARDING_GREETING = "Hey, I'm NAO. How can I help you?"
+
+# Nao says nothing on wake by default -- no introduction, no name request.
+# It just listens and answers. Set WAKE_GREETING=1 to bring the spoken
+# greeting back.
+_WAKE_GREETING = os.environ.get("WAKE_GREETING", "0") == "1"
+
+# Set ASK_NAME_ON_WAKE=1 to restore the old "what should I call you?" gate.
+# Off by default: enrolment is not worth blocking the first answer on, and
+# a face can still be taught at any time with "remember me as <name>".
+_ASK_NAME_ON_WAKE = os.environ.get("ASK_NAME_ON_WAKE", "0") == "1"
 _ONBOARDING_NAME_RETRY = "Sorry, what name should I call you?"
 
 # Give up asking after this many rejected answers and carry on as `guest`.
@@ -1503,9 +1808,8 @@ async def _emit_onboarding_name_retry(
         pass
 
     if mp3:
-        await _send_json(
-            ws,
-            _audio_chunk_frame(sess.next_seq(), text, mp3),
+        await _send_audio_chunk(
+            ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3),
         )
         try:
             legacy.LAST_REPLY[sess.username] = text
@@ -1569,9 +1873,8 @@ async def _emit_returning_identity_greeting(
         pass
 
     if mp3:
-        await _send_json(
-            ws,
-            _audio_chunk_frame(sess.next_seq(), text, mp3),
+        await _send_audio_chunk(
+            ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3),
         )
         try:
             legacy.LAST_REPLY[sess.username] = text
@@ -1602,7 +1905,11 @@ async def _emit_onboarding_name_prompt(
     *,
     reason: str,
 ) -> None:
-    """Ask an unknown visible face for their name via the ElevenLabs path."""
+    """Greet an unknown visible face, once, via the ElevenLabs path.
+
+    Introduces Nao and hands straight back to the user so their first
+    question gets answered. Only asks for a name when ASK_NAME_ON_WAKE=1.
+    """
     identity = _IDENTIFIED_USERS.get(sess.session_id) or {}
     if identity.get("recognized") and identity.get("name"):
         sess.asking_name = False
@@ -1613,11 +1920,26 @@ async def _emit_onboarding_name_prompt(
             reason="recognized_identity_present",
         )
         return
-    if sess.asking_name:
+    if sess.greeted:
         return
-    sess.asking_name = True
+    sess.greeted = True
 
-    text = _ONBOARDING_NAME_PROMPT
+    if not (_WAKE_GREETING or _ASK_NAME_ON_WAKE):
+        # Nothing to say on wake. Returning before synth also means Nao does
+        # not hear itself here at all, which is the single biggest source of
+        # the self-echo turns that follow a wake.
+        sess.asking_name = False
+        logger.info(
+            "wake_greeting_skipped",
+            user=sess.username, session_id=sess.session_id, reason=reason,
+        )
+        return
+
+    # `asking_name` gates the name-answer branch in `_process_turn`. Leaving
+    # it False is what lets the very next utterance dispatch to the agent and
+    # get an actual answer.
+    sess.asking_name = bool(_ASK_NAME_ON_WAKE)
+    text = _ONBOARDING_NAME_PROMPT if _ASK_NAME_ON_WAKE else _ONBOARDING_GREETING
     phase_ms: dict[str, float] = {}
     with _phase("onboarding_name_prompt_synth", phase_ms):
         try:
@@ -1639,9 +1961,8 @@ async def _emit_onboarding_name_prompt(
         pass
 
     if mp3:
-        await _send_json(
-            ws,
-            _audio_chunk_frame(sess.next_seq(), text, mp3),
+        await _send_audio_chunk(
+            ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3),
         )
         try:
             legacy.LAST_REPLY[sess.username] = text
@@ -2018,9 +2339,8 @@ async def _emit_agent_turn(ws: WebSocket, sess: _Session,
                         "tts_chunk_skipped", text=tts_text,
                     ))
                     continue
-                await _send_json(
-                    ws,
-                    _audio_chunk_frame(
+                await _send_audio_chunk(
+                    ws, sess, _audio_chunk_frame(
                         sess.next_seq(), tts_text, mp3,
                         pause_after_ms=pause_after_ms,
                     ),
@@ -2293,6 +2613,12 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     # above already returned. So when Silero ran and confirmed speech, tell the
     # filter -- otherwise its length backstop swallows one-word turns like a
     # bare first name ("Mia") and NAO answers nothing at all.
+    # Spoken mute/unmute is checked first: the commands are one or two
+    # words, and the reject filter below treats utterances that short as
+    # noise, so anything after it would never see them.
+    if await _handle_mute_command(ws, sess, transcript):
+        return
+
     reason = legacy.transcript_reject_reason(
         sess.username, transcript, asking_name=sess.asking_name,
         had_speech=bool(turn_silero_available and turn_had_speech),
@@ -2307,6 +2633,21 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
         )
         await _send_json(ws, _control_frame(
             "transcript", transcript=transcript, reject_reason=reason,
+        ))
+        return
+
+    # Stateless self-echo check: runs for every turn, including while
+    # `asking_name` is set and regardless of whose session this is.
+    if _is_system_line_echo(transcript):
+        logger.info(
+            "turn_rejected",
+            user=sess.username, session_id=sess.session_id,
+            turn_idx=sess.turn_idx + 1, phase_ms=phase_ms,
+            transcript=(transcript or "")[:200],
+            reason="system_line_echo",
+        )
+        await _send_json(ws, _control_frame(
+            "echo_reject", transcript=transcript, reason="system_line_echo",
         ))
         return
 
@@ -2360,18 +2701,51 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
             sess.asking_name = False
             await _emit_motion(ws, sess, transcript, name_motion, phase_ms)
             return
-        _cancel_pending_vision(sess)
+        # The general echo guard above is skipped while `asking_name` is set,
+        # and until now that was harmless because every non-name utterance was
+        # discarded here anyway. This branch dispatches instead, so the guard
+        # has to run before we let anything through -- otherwise Nao answers
+        # its own voice, which it hears constantly now that the mic stays open
+        # during TTS for the spoken-mute feature.
+        if _is_substring_or_sentence_echo(sess.username, transcript):
+            _cancel_pending_vision(sess)
+            logger.info(
+                "turn_rejected",
+                user=sess.username, session_id=sess.session_id,
+                turn_idx=sess.turn_idx + 1, phase_ms=phase_ms,
+                transcript=(transcript or "")[:200],
+                reason="self_echo_while_asking_name",
+            )
+            await _send_json(ws, _control_frame(
+                "echo_reject",
+                transcript=transcript,
+                reason="self_echo",
+            ))
+            return
+
+        # Not a name -- but it IS real speech, because empty and noise
+        # transcripts were rejected further up. So this person is talking TO
+        # Nao rather than answering its onboarding question, and answering
+        # them wins over finishing enrolment: drop the name request and let
+        # the turn dispatch normally.
+        #
+        # This used to re-prompt and throw the turn away, which trapped
+        # anyone who opened with a question instead of a name -- Nao asked
+        # "what should I call you?" up to three times, ignored every actual
+        # question, then went silent still having answered nothing.
+        #
+        # The face is still learnable: the wake path asks once, and the
+        # "remember me as X" fast-path stays available at any later point.
+        # Deliberately no `_cancel_pending_vision` here -- unlike the branches
+        # around it this turn is continuing, and the normal path still wants
+        # the pending frame.
+        sess.asking_name = False
         logger.info(
-            "turn_complete",
+            "onboarding_name_deferred",
             user=sess.username, session_id=sess.session_id,
-            turn_idx=sess.turn_idx + 1, phase_ms=phase_ms,
+            turn_idx=sess.turn_idx + 1,
             transcript=(transcript or "")[:200],
-            outcome="rejected", reject_reason="asking_name_not_name",
         )
-        await _emit_onboarding_name_retry(
-            ws, sess, reason="asking_name_not_name",
-        )
-        return
 
     # Semantic endpointing — wait for more audio if the user trailed off.
     from server import semantic_endpoint
@@ -2499,20 +2873,34 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
         # could echo back through STT and trigger a self-conversation
         # loop.
         now_ms = time.time() * 1000.0
-        if now_ms < sess.tts_active_until_ms:
-            counter = _resolve_echo_drop_counter()
-            if counter is not None:
+        in_tts_window = now_ms < sess.tts_active_until_ms
+        turn_running = _agent_turn_running(sess)
+        # The robot tells us whether its own speaker was live when this audio
+        # was captured. Trust that over `tts_active_until_ms`, which is armed
+        # when the server finishes *sending* chunks -- seconds before the
+        # robot finishes *playing* them. That gap is precisely the window in
+        # which someone says "mute", and without this flag the audio fell
+        # through to the turn pipeline and the mute listener never ran once.
+        robot_speaking = bool(frame.get("speaking"))
+        if in_tts_window or turn_running or robot_speaking:
+            if in_tts_window:
+                counter = _resolve_echo_drop_counter()
+                if counter is not None:
+                    try:
+                        counter.inc()
+                    except Exception:
+                        pass
+            # Dropped from the turn pipeline exactly as before -- but copied
+            # to the mute listener first, which is the only way a spoken
+            # "mute" can be heard while NAO is talking over it. Decoding is
+            # cheap and the listener is a no-op when disabled.
+            if MUTE_LISTEN_ENABLED:
                 try:
-                    counter.inc()
+                    _pcm = base64.b64decode(frame.get("data") or "")
                 except Exception:
-                    pass
-            return True
-
-        # While the previous turn is still generating/speaking, do not build
-        # a second utterance from room noise or the user's next words. The
-        # robot sends explicit barge_in control frames for interruption; raw
-        # mic frames during this window were creating duplicate no_voice turns.
-        if _agent_turn_running(sess):
+                    _pcm = b""
+                if _pcm:
+                    await _feed_mute_listener(ws, sess, _pcm)
             return True
 
         b64 = frame.get("data") or ""
@@ -2720,7 +3108,7 @@ async def _handle_wake_event(ws: WebSocket, sess: _Session,
             sess.face_id = face_id
             if is_returning and display_name:
                 try:
-                    sess.username = str(display_name).strip().lower()
+                    _rebind_username(sess, str(display_name))
                     sess.asking_name = False
                 except Exception:
                     pass
@@ -2759,9 +3147,8 @@ async def _handle_wake_event(ws: WebSocket, sess: _Session,
             _reset_reply_chunks(sess.username, greeting)
 
             if mp3:
-                await _send_json(
-                    ws,
-                    _audio_chunk_frame(sess.next_seq(), greeting, mp3),
+                await _send_audio_chunk(
+                    ws, sess, _audio_chunk_frame(sess.next_seq(), greeting, mp3),
                 )
             else:
                 # TTS failed — emit a transcript-only control so the robot
@@ -3014,8 +3401,8 @@ async def _maybe_announce_camera_consent(ws: WebSocket, sess: _Session) -> None:
         except Exception:
             pass
         try:
-            await _send_json(
-                ws, _audio_chunk_frame(sess.next_seq(), text, mp3),
+            await _send_audio_chunk(
+                ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -3220,7 +3607,7 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         # memory + voice-profile-prefs persist correctly across sessions.
         if face_name and recognized:
             try:
-                sess.username = face_name.lower()
+                _rebind_username(sess, face_name)
             except Exception:
                 pass
         logger.info(
