@@ -36,10 +36,10 @@ import asyncio
 import contextlib
 import os
 import time
-from typing import Optional
 
 import structlog
-from openai import OpenAI
+
+from server import llm_compat
 
 
 log = structlog.get_logger("sage.semantic_endpoint")
@@ -51,35 +51,14 @@ log = structlog.get_logger("sage.semantic_endpoint")
 # `server/server.py` and `server/app_ws.py` that test ``USE_SEMANTIC_ENDPOINT``
 # before calling in.
 USE_SEMANTIC_ENDPOINT: bool = os.environ.get("USE_SEMANTIC_ENDPOINT", "1") == "1"
-# gpt-4o-mini was chosen empirically: gpt-4.1-nano misjudged trailing-off
-# phrases ("I need…") as complete; gpt-4o-mini classifies them correctly at
-# +60 ms latency. Override via env if a stronger / cheaper tier is desired.
-_MODEL: str = os.environ.get("SEMANTIC_ENDPOINT_MODEL", "gpt-4o-mini")
-
-
-# ── Lazy OpenAI client ──────────────────────────────────────────────────────
-# Lazy so importing this module doesn't blow up when OPENAI_API_KEY is unset
-# (e.g., the verification block at the bottom of this file, or any unit test
-# that wants to monkeypatch the call). The construction itself is cached.
-_client: Optional[OpenAI] = None
-
-
-def _get_client() -> OpenAI:
-    """Return a singleton OpenAI client, building it on first call.
-
-    Raises ``RuntimeError`` if ``OPENAI_API_KEY`` is missing — the caller in
-    ``is_complete_thought`` catches that and fails open. We deliberately
-    don't import ``server.config`` here: that module reads
-    ``os.environ["OPENAI_API_KEY"]`` at import time and would crash this
-    module on import in keyless environments.
-    """
-    global _client
-    if _client is None:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
-        _client = OpenAI(api_key=api_key)
-    return _client
+# Runs on EVERY turn, so latency matters more than depth -- Haiku is the
+# right tier for a yes/no judgement. Accepts an id from either provider;
+# `llm_compat.chat` dispatches on the name, so switching is an env change.
+#
+# History: gpt-4.1-nano misjudged trailing-off phrases ("I need...") as
+# complete and gpt-4o-mini got them right at +60 ms, which is why the old
+# OpenAI default was the larger of the two. Re-measure if you change tier.
+_MODEL: str = os.environ.get("SEMANTIC_ENDPOINT_MODEL", "claude-haiku-4-5")
 
 
 # ── LRU + TTL cache ─────────────────────────────────────────────────────────
@@ -128,10 +107,25 @@ def _evict_oldest_locked() -> None:
 # tight, since the EoU arbiter only consults this signal when silence-based
 # signals already point toward "turn done", so the model rarely sees true
 # garden-path fragments anyway.
+# Examples rather than a bare instruction: the input is raw STT with no
+# punctuation, so "has this person finished talking?" is genuinely ambiguous
+# without anchors, and different models split the difference differently.
+# A one-line prompt had claude-haiku-4-5 calling "can you tell me about the
+# CS program" a fragment (it is a finished question, just unpunctuated) and
+# gpt-4.1-nano calling "what time is it" a fragment.
 _SYSTEM = (
-    "You decide if a user's spoken sentence is a complete thought "
-    "or just a fragment they are still finishing. Reply with exactly one "
-    "word: \"yes\" if complete, \"no\" if fragment."
+    "You decide whether a person has FINISHED speaking or is still "
+    "mid-sentence. Input is speech-to-text with no punctuation, so judge "
+    "the words alone -- a missing question mark or period means nothing.\n"
+    "Answer \"yes\" if the thought is finished, even when phrased casually "
+    "or ungrammatically.\n"
+    "Answer \"no\" only when it clearly breaks off mid-clause -- trailing "
+    "conjunctions, prepositions, articles or auxiliaries.\n"
+    "yes: what time is it / can you tell me about the CS program / "
+    "I'm feeling anxious today / tell me a joke / no thanks\n"
+    "no: I need / so I was thinking that maybe / and then he said / "
+    "could you please / it's kind of\n"
+    "Reply with exactly one word: yes or no."
 )
 
 
@@ -267,23 +261,30 @@ async def is_complete_thought(transcript: str) -> bool:
 def _call_llm(transcript: str) -> bool:
     """Synchronous helper run inside ``asyncio.to_thread``.
 
-    Kept private; ``is_complete_thought`` is the only intended caller. The
-    OpenAI SDK is sync-only at this version (0.13.x), so we run the request
-    on a worker thread and let asyncio schedule around it. ``max_tokens=1``
-    means at most one BPE token comes back (typically literally "yes" or
-    "no"), so the round-trip is dominated by network latency, not decoding.
+    Kept private; ``is_complete_thought`` is the only intended caller.
+
+    Goes through ``llm_compat.chat`` rather than a provider client directly,
+    so ``SEMANTIC_ENDPOINT_MODEL`` can name either provider. A direct client
+    here silently pinned this to OpenAI: it ran on every turn, on a stack
+    whose agents are otherwise all Claude, and no env setting could move it.
+
+    Both provider clients are sync, so this runs on a worker thread via
+    ``asyncio.to_thread``. The reply is a single word, so the round trip is
+    dominated by network latency, not decoding.
     """
-    client = _get_client()
-    resp = client.chat.completions.create(
-        model=_MODEL,
-        temperature=0,
-        max_tokens=1,
-        messages=[
+    raw = llm_compat.chat(
+        _MODEL,
+        [
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": transcript},
         ],
-    )
-    raw = (resp.choices[0].message.content or "").strip().lower()
+        # Not 1. OpenAI counts one BPE token, which is enough for "yes", but
+        # Anthropic can spend the budget on a leading space or newline and
+        # return nothing usable. A handful of tokens costs no measurable
+        # latency and only the first word is read anyway.
+        max_tokens=8,
+        temperature=0,
+    ).strip().lower()
     # Take only the first whitespace-separated token. ``max_tokens=1`` should
     # already enforce this, but BPE quirks (e.g., "yes." as a single token)
     # can sneak punctuation in — split() handles that.

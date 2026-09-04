@@ -441,10 +441,27 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, module: Any,
                   client: Any) -> None:
     """Belt-and-braces: every plausible client-injection attr is patched.
 
-    The Phase-2 contract introduces a ``_get_client()`` helper to make the
-    OpenAI client mockable. Until that lands, the legacy code path holds the
-    client at module level as ``_client`` — patch both.
+    Three generations of this module, in order of preference:
+
+    1. Current: no client of its own — it calls ``llm_compat.chat`` so the
+       provider is a config choice. Patch that, adapting the OpenAI-shaped
+       ``_CountingClient`` onto the ``chat()`` signature so the existing
+       stub (and its call counter / raise behaviour) still works.
+    2. Phase 2: a ``_get_client()`` helper.
+    3. Legacy: a module-level ``_client``.
+
+    Without branch 1 these tests silently patch nothing and issue real
+    network calls — which is exactly how they started failing when the
+    direct OpenAI client was removed.
     """
+    llm_compat = getattr(module, "llm_compat", None)
+    if llm_compat is not None:
+        def _chat(model, messages, **kwargs):
+            resp = client.chat.completions.create(
+                model=model, messages=messages, **kwargs)
+            return resp.choices[0].message.content or ""
+        monkeypatch.setattr(llm_compat, "chat", _chat, raising=False)
+
     if hasattr(module, "_get_client"):
         monkeypatch.setattr(module, "_get_client",
                             lambda: client, raising=False)
@@ -454,10 +471,13 @@ def _patch_client(monkeypatch: pytest.MonkeyPatch, module: Any,
 
 def _clear_semantic_cache(module: Any) -> None:
     """Reset whichever cache implementation the module ships with."""
-    cache = getattr(module, "_cache", None)
-    if isinstance(cache, dict):
-        cache.clear()
-        return
+    # The live module names it `_CACHE`; older revisions used `_cache`.
+    # Checking only the lowercase name left a warm cache between tests.
+    for attr in ("_CACHE", "_cache"):
+        cache = getattr(module, attr, None)
+        if isinstance(cache, dict):
+            cache.clear()
+            return
     # If the module exposes a clearable LRU on the sync function itself
     # (typical functools.lru_cache pattern), poke it.
     fn = getattr(module, "is_complete_thought_sync", None)

@@ -22,12 +22,24 @@ never boots — and the fallback paths, vision, and safety all still need it.
 - `server/model_factory.py` — for agents on the Agents SDK. `resolve_model()`
   passes OpenAI ids through as strings and wraps `claude-*` ids in
   `LitellmModel`. Any `*_MODEL` env var can name either provider.
-- `server/llm_compat.py` — for the seven call sites that use a provider client
+- `server/llm_compat.py` — for the call sites that use a provider client
   *directly* and never touch the SDK (crisis classifier in `safety.py`,
   `identify_distortion` / `suggest_reframe` / vision in `tools/emotion.py`,
-  rollups in `memory_rollup.py`). `chat()` takes OpenAI-shaped messages and
+  rollups in `memory_rollup.py`, and the endpointing check in
+  `semantic_endpoint.py`). `chat()` takes OpenAI-shaped messages and
   dispatches on model name. **If you add a direct client call, route it
   through here or it silently pins that feature to one provider.**
+
+  That warning is not theoretical: `semantic_endpoint.py` did
+  `from openai import OpenAI` and ran on **every turn**, so the stack was
+  still calling OpenAI once per turn long after the agents moved to Claude —
+  and no value of `SEMANTIC_ENDPOINT_MODEL` could change it, because the
+  module never consulted the dispatcher. Fixed 2026-09-04; it now defaults to
+  `claude-haiku-4-5` (12/12 on the endpointing cases, median 557 ms, versus a
+  miss on "what time is it" from `gpt-4.1-nano`). Regression test:
+  `server/tests/test_semantic_endpoint_provider.py` asserts `_get_client` is
+  gone. To find any that remain:
+  `grep -rn "from openai import\|import openai" server --include="*.py"`.
 
 Gotcha: `llm_compat` drops `temperature` for Anthropic on purpose. Sampling
 params are removed on current Claude models — Opus 5 returns
