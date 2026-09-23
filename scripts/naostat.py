@@ -3,17 +3,24 @@
 
     ./scripts/naostat.py              probe everything once and print
     ./scripts/naostat.py --watch      refresh every 10s until Ctrl-C
-    ./scripts/naostat.py --scan       sweep the /24 for the robot if the
-                                      known addresses all miss
+    ./scripts/naostat.py --scan       force a /24 sweep even on a cache hit
+                                      (a sweep already runs automatically
+                                      whenever the known addresses all miss)
     ./scripts/naostat.py --no-color   plain text
 
 Stdlib only; runs on the Mac's python3. Every panel reports what it actually
 measured -- a field it could not read prints "--", never a guess.
 
 Two house rules from CLAUDE.md are baked in:
-  * reachability is a TCP probe of port 22, never ping (this network drops ICMP)
-  * a host is only believed once `hostname` confirms it, because the DHCP lease
+  * never ping to test reachability -- this network drops ICMP
+  * a host is only believed once it says what it is, because the DHCP lease
     moves and `ssh nao` has landed on the Pi before now
+
+Discovery tries, in order: the last address that worked, mDNS, whatever the Pi
+can see (live :5050 peer, then its ARP table), ~/.ssh/config, .env, and finally
+a /24 sweep. All of those go stale at once often enough that no single one is
+trusted -- that is what once reported the robot offline while it sat on .129
+talking to the Pi.
 """
 from __future__ import annotations
 
@@ -104,15 +111,33 @@ def bar(pct: float, cells: int = 16, tone: str = "") -> str:
 # ---------------------------------------------------------------- primitives
 
 def run(cmd: list[str], timeout: int = 12) -> tuple[int, str]:
+    """Return (rc, stdout). stderr is dropped on purpose: the robot's sshd
+    prints a multi-line warning banner there, and merging it into stdout makes
+    the banner read as the first line of every command's output -- which turned
+    `hostname` into a warning string and let any host pass as the robot."""
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        return p.returncode, p.stdout or ""
     except (subprocess.TimeoutExpired, OSError):
         return 124, ""
 
 
-def ssh(host: str, script: str, timeout: int = 15) -> tuple[int, str]:
-    return run(SSH + [host, script], timeout=timeout)
+def ssh(host: str, script: str, timeout: int = 15, attempts: int = 1) -> tuple[int, str]:
+    """Run a script over ssh, optionally retrying.
+
+    The robot's WiFi link drops connects perfectly often -- measured at 3 of 5
+    attempts timing out while the host was up and serving. A single failed
+    connect therefore means nothing, so anything that concludes "not there"
+    from a miss has to retry first.
+    """
+    rc, out = 124, ""
+    for i in range(max(1, attempts)):
+        rc, out = run(SSH + [host, script], timeout=timeout)
+        if rc == 0 and out.strip():
+            return rc, out
+        if i + 1 < attempts:
+            time.sleep(1.0)
+    return rc, out
 
 
 def port_open(ip: str, port: int = 22, timeout: float = 1.2) -> bool:
@@ -163,7 +188,8 @@ def local_subnet() -> str | None:
 
 
 def sweep(prefix: str) -> list[str]:
-    """TCP :22 across the /24. Only used with --scan."""
+    """TCP :22 across the /24, to narrow 254 hosts down to a handful worth
+    an ssh. The last resort when every known address has gone stale."""
     hosts = [f"{prefix}.{i}" for i in range(1, 255)]
     found = []
     with futures.ThreadPoolExecutor(max_workers=64) as pool:
@@ -175,73 +201,150 @@ def sweep(prefix: str) -> list[str]:
 
 # ---------------------------------------------------------------- discovery
 
-def identify(ip: str) -> str | None:
-    """Return the remote hostname, so we never mistake the Pi for the robot."""
-    rc, out = ssh(f"nao@{ip}", "hostname", timeout=8)
-    return out.strip().splitlines()[0] if rc == 0 and out.strip() else None
+CACHE = Path.home() / ".cache" / "naostat" / "robot_ip"
+IPV4 = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
 
-def find_robot(scan: bool) -> dict:
-    """The robot's lease moves constantly. Try every known address, confirm by
-    hostname, and only then believe it."""
-    seen, candidates = set(), []
-    for src, val in (
-        ("mdns nao.local", mdns("nao.local")),
-        ("ssh config", ssh_config_host("nao")),
-        (".env NAO_IP", env_value("NAO_IP")),
-    ):
-        if val and val not in seen:
+def cache_read() -> str | None:
+    try:
+        ip = CACHE.read_text().strip()
+        return ip if IPV4.match(ip) else None
+    except OSError:
+        return None
+
+
+def cache_write(ip: str) -> None:
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(ip + "\n")
+    except OSError:
+        pass
+
+
+def identify(ip: str) -> dict:
+    """Ask a host what it is, rather than trusting the address it answered on.
+
+    Returns {} when nothing usable came back. The robot runs NAOqiOS, so
+    /etc/os-release is the reliable tell -- its hostname is plain "nao", which
+    is too generic to bet on alone.
+    """
+    rc, out = ssh(f"nao@{ip}", "hostname; cat /etc/os-release 2>/dev/null",
+                  timeout=10, attempts=3)
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    if rc != 0 or not lines:
+        return {}
+    host = lines[0]
+    blob = out.lower()
+    return {"ip": ip, "host": host,
+            "is_robot": "naoqi" in blob,
+            "is_pi": host == "naoserver"}
+
+
+def _first_match(candidates: list[tuple[str, str]], want: str) -> dict | None:
+    """Identify every candidate in parallel and return the first that matches,
+    in the order given -- so a cheap trusted source beats a sweep hit.
+
+    Deliberately NOT gated behind a port probe. The robot's sshd is slow to
+    accept: a 1.2s TCP probe reports :22 closed while `ssh` to the same address
+    connects fine a second later, which made the robot vanish from this report
+    at random. ssh carries its own ConnectTimeout, so let it be the judge.
+    The sweep still pre-filters -- there, one probe each beats 254 ssh attempts.
+    """
+    if not candidates:
+        return None
+    ips = [ip for _, ip in candidates]
+    with futures.ThreadPoolExecutor(max_workers=16) as pool:
+        facts = dict(zip(ips, pool.map(identify, ips)))
+    for src, ip in candidates:
+        f = facts.get(ip) or {}
+        if f.get(want):
+            return {**f, "via": src}
+    return None
+
+
+def hints_from_pi(pi_ip: str | None) -> list[str]:
+    """The Pi can see the robot even when this laptop cannot: as a live
+    WebSocket peer on :5050, or simply as an ARP neighbour."""
+    if not pi_ip:
+        return []
+    script = (
+        "ss -tn 2>/dev/null | awk '/:5050/{print $5}' | cut -d: -f1; "
+        "ip neigh 2>/dev/null | grep -vE 'FAILED|INCOMPLETE' | awk '{print $1}'"
+    )
+    _, out = ssh(f"nao@{pi_ip}", script, timeout=12)
+    seen, ips = set(), []
+    for line in out.splitlines():
+        ip = line.strip()
+        if IPV4.match(ip) and ip != pi_ip and not ip.endswith(".255") and ip not in seen:
+            seen.add(ip)
+            ips.append(ip)
+    return ips
+
+
+def find_robot(scan: bool, pi_ip: str | None = None) -> dict:
+    """The robot's DHCP lease moves constantly, so no single source is trusted.
+
+    Sources are tried cheapest-first; the sweep is a real fallback rather than
+    an opt-in, because the addresses in mDNS, ~/.ssh/config and .env are all
+    routinely stale at the same time -- which is what made this report the
+    robot offline while it was sitting on .129 talking to the Pi.
+    """
+    seen: set[str] = set()
+    candidates: list[tuple[str, str]] = []
+
+    def add(src: str, val: str | None) -> None:
+        if val and IPV4.match(val) and val not in seen:
             seen.add(val)
             candidates.append((src, val))
 
-    tried = []
-    for src, ip in candidates:
-        if not port_open(ip):
-            tried.append(f"{ip} ({src})")
-            continue
-        host = identify(ip)
-        if host and host != "naoserver":
-            return {"ip": ip, "via": src, "host": host, "tried": tried}
-        tried.append(f"{ip} ({src}, {'is the Pi' if host == 'naoserver' else 'no ssh'})")
+    add("last known", cache_read())
+    add("mdns nao.local", mdns("nao.local"))
+    for ip in hints_from_pi(pi_ip):
+        add("seen by the Pi", ip)
+    add("ssh config", ssh_config_host("nao"))
+    add(".env NAO_IP", env_value("NAO_IP"))
 
-    if scan:
+    hit = _first_match(candidates, "is_robot")
+    if not hit or scan:
         prefix = local_subnet()
         if prefix:
-            for ip in sweep(prefix):
-                if ip in seen:
-                    continue
-                host = identify(ip)
-                if host and host not in ("naoserver",) and "nao" in host.lower():
-                    return {"ip": ip, "via": "subnet scan", "host": host, "tried": tried}
-    return {"ip": None, "via": None, "host": None, "tried": tried}
+            swept = [("subnet sweep", ip) for ip in sweep(prefix) if ip not in seen]
+            hit = _first_match(swept, "is_robot")
+
+    if hit:
+        cache_write(hit["ip"])
+        return {**hit, "tried": [f"{ip} ({src})" for src, ip in candidates]}
+    return {"ip": None, "via": None, "host": None,
+            "tried": [f"{ip} ({src})" for src, ip in candidates]}
 
 
 def find_pi() -> dict:
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for src, val in (
         ("mdns naoserver.local", mdns("naoserver.local")),
         ("ssh config", ssh_config_host("naoserver")),
         (".env PI_IP", env_value("PI_IP")),
     ):
-        if val and port_open(val):
-            host = identify(val)
-            if host == "naoserver":
-                return {"ip": val, "via": src}
-    return {"ip": None, "via": None}
+        if val and IPV4.match(val) and val not in seen:
+            seen.add(val)
+            candidates.append((src, val))
+    return _first_match(candidates, "is_pi") or {"ip": None, "via": None}
 
 
 # ---------------------------------------------------------------- collectors
 
 ROBOT_PROBE = r"""
 echo "uptime:$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
-echo "main:$(pgrep -f '[m]ain\.py' | head -1)"
+echo "main:$(pgrep -f 'python.*[m]ain\.py' | head -1)"
 for c in "qicli call ALBattery.getBatteryCharge" \
          "qicli call ALMemory.getData Device/SubDeviceList/Battery/Charge/Sensor/Value"; do
   v=$($c 2>/dev/null | tr -d '\r' | tail -1)
   if [ -n "$v" ]; then echo "battery:$v"; break; fi
 done
 echo "charging:$(qicli call ALMemory.getData Device/SubDeviceList/Battery/Charge/Sensor/Status 2>/dev/null | tr -d '\r' | tail -1)"
-echo "micraw:$(amixer -c 0 sget 'Numeric Left mics' 2>/dev/null | grep -oE ': Capture [0-9]+' | grep -oE '[0-9]+' | head -1)"
-echo "server:$(grep -oE 'SERVER_IP=[0-9.]+' /home/nao/launch_nao_assist.sh 2>/dev/null | head -1 | cut -d= -f2)"
+echo "micraw:$(amixer -c 0 sget 'Numeric Left mics' 2>/dev/null | sed -n 's/.*Front Left: Capture \([0-9][0-9]*\).*/\1/p' | head -1)"
+echo "server:$(ps ax 2>/dev/null | grep '[m]ain\.py' | grep -oE 'SERVER_IP=[0-9.]+' | head -1 | cut -d= -f2)"
 echo "log:$(ls -t /home/nao/nao_assist/logs/*.jsonl 2>/dev/null | head -1)"
 """
 
@@ -274,18 +377,18 @@ def parse_kv(text: str) -> dict:
     return out
 
 
-def collect_robot(scan: bool) -> dict:
-    info = find_robot(scan)
+def collect_robot(scan: bool, pi_ip: str | None = None) -> dict:
+    info = find_robot(scan, pi_ip)
     if not info["ip"]:
         return {"up": False, **info}
-    rc, out = ssh(f"nao@{info['ip']}", ROBOT_PROBE, timeout=20)
+    rc, out = ssh(f"nao@{info['ip']}", ROBOT_PROBE, timeout=20, attempts=3)
     raw = parse_kv(out)
     return {"up": bool(raw), "raw": raw, **info}
 
 
-def collect_pi() -> dict:
-    info = find_pi()
-    if not info["ip"]:
+def collect_pi(info: dict | None = None) -> dict:
+    info = info if info is not None else find_pi()
+    if not info.get("ip"):
         return {"up": False, **info}
     rc, out = ssh(f"nao@{info['ip']}", PI_PROBE, timeout=25)
     raw = parse_kv(out)
@@ -470,9 +573,10 @@ def render(robot: dict, pi: dict, local: dict) -> str:
 # ---------------------------------------------------------------- entrypoint
 
 def probe(scan: bool) -> str:
+    pi_info = find_pi()
     with futures.ThreadPoolExecutor(max_workers=3) as pool:
-        f_robot = pool.submit(collect_robot, scan)
-        f_pi = pool.submit(collect_pi)
+        f_robot = pool.submit(collect_robot, scan, pi_info.get("ip"))
+        f_pi = pool.submit(collect_pi, pi_info)
         f_local = pool.submit(collect_local)
         return render(f_robot.result(), f_pi.result(), f_local.result())
 
