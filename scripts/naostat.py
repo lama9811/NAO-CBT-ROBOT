@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""naostat -- one-screen diagnostics for the robot, the Pi and this laptop.
+
+    ./scripts/naostat.py              probe everything once and print
+    ./scripts/naostat.py --watch      refresh every 10s until Ctrl-C
+    ./scripts/naostat.py --scan       sweep the /24 for the robot if the
+                                      known addresses all miss
+    ./scripts/naostat.py --no-color   plain text
+
+Stdlib only; runs on the Mac's python3. Every panel reports what it actually
+measured -- a field it could not read prints "--", never a guess.
+
+Two house rules from CLAUDE.md are baked in:
+  * reachability is a TCP probe of port 22, never ping (this network drops ICMP)
+  * a host is only believed once `hostname` confirms it, because the DHCP lease
+    moves and `ssh nao` has landed on the Pi before now
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as futures
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+ENV = REPO / ".env"
+SSH_CONFIG = Path.home() / ".ssh" / "config"
+PI_REPO = "~/nao-sagecbt"
+
+SSH = [
+    "ssh",
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=5",
+    "-o", "LogLevel=ERROR",
+]
+
+# ---------------------------------------------------------------- formatting
+
+class C:
+    """ANSI colors, blanked out when the output is not a terminal."""
+    on = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    reset = "\033[0m" if on else ""
+    dim = "\033[2m" if on else ""
+    bold = "\033[1m" if on else ""
+    red = "\033[31m" if on else ""
+    green = "\033[32m" if on else ""
+    yellow = "\033[33m" if on else ""
+    blue = "\033[34m" if on else ""
+    cyan = "\033[36m" if on else ""
+    grey = "\033[90m" if on else ""
+
+
+def width() -> int:
+    return min(shutil.get_terminal_size((88, 24)).columns, 100)
+
+
+def plain(s: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+def rule(title: str = "") -> str:
+    w = width()
+    if not title:
+        return f"{C.grey}{'-' * w}{C.reset}"
+    bar = "-" * max(0, w - len(title) - 3)
+    return f"{C.grey}--{C.reset} {C.bold}{title}{C.reset} {C.grey}{bar}{C.reset}"
+
+
+def row(label: str, value: str, tone: str = "") -> str:
+    return f"  {C.grey}{label:<13}{C.reset}{tone}{value}{C.reset}"
+
+
+def badge(text: str, tone: str) -> str:
+    return f"{tone}{C.bold}[{text}]{C.reset}"
+
+
+def ago(seconds: float | None) -> str:
+    if seconds is None:
+        return "--"
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def bar(pct: float, cells: int = 16, tone: str = "") -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100 * cells))
+    return f"{tone}{'#' * filled}{C.grey}{'.' * (cells - filled)}{C.reset}"
+
+
+# ---------------------------------------------------------------- primitives
+
+def run(cmd: list[str], timeout: int = 12) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except (subprocess.TimeoutExpired, OSError):
+        return 124, ""
+
+
+def ssh(host: str, script: str, timeout: int = 15) -> tuple[int, str]:
+    return run(SSH + [host, script], timeout=timeout)
+
+
+def port_open(ip: str, port: int = 22, timeout: float = 1.2) -> bool:
+    """TCP probe. A refusal still means the host is up, but for :22 we want the
+    service, so only a completed connection counts."""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def mdns(name: str) -> str | None:
+    try:
+        return socket.gethostbyname(name)
+    except OSError:
+        return None
+
+
+def env_value(key: str) -> str | None:
+    if not ENV.exists():
+        return None
+    for line in ENV.read_text(errors="replace").splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def ssh_config_host(alias: str) -> str | None:
+    if not SSH_CONFIG.exists():
+        return None
+    current, text = None, SSH_CONFIG.read_text(errors="replace")
+    for line in text.splitlines():
+        s = line.strip()
+        if s.lower().startswith("host "):
+            current = s.split(None, 1)[1].strip()
+        elif current == alias and s.lower().startswith("hostname"):
+            return s.split(None, 1)[1].strip()
+    return None
+
+
+def local_subnet() -> str | None:
+    rc, out = run(["ipconfig", "getifaddr", "en0"], timeout=4)
+    ip = out.strip()
+    if rc or not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        return None
+    return ip.rsplit(".", 1)[0]
+
+
+def sweep(prefix: str) -> list[str]:
+    """TCP :22 across the /24. Only used with --scan."""
+    hosts = [f"{prefix}.{i}" for i in range(1, 255)]
+    found = []
+    with futures.ThreadPoolExecutor(max_workers=64) as pool:
+        for ip, ok in zip(hosts, pool.map(lambda h: port_open(h, 22, 0.6), hosts)):
+            if ok:
+                found.append(ip)
+    return found
+
+
+# ---------------------------------------------------------------- discovery
+
+def identify(ip: str) -> str | None:
+    """Return the remote hostname, so we never mistake the Pi for the robot."""
+    rc, out = ssh(f"nao@{ip}", "hostname", timeout=8)
+    return out.strip().splitlines()[0] if rc == 0 and out.strip() else None
+
+
+def find_robot(scan: bool) -> dict:
+    """The robot's lease moves constantly. Try every known address, confirm by
+    hostname, and only then believe it."""
+    seen, candidates = set(), []
+    for src, val in (
+        ("mdns nao.local", mdns("nao.local")),
+        ("ssh config", ssh_config_host("nao")),
+        (".env NAO_IP", env_value("NAO_IP")),
+    ):
+        if val and val not in seen:
+            seen.add(val)
+            candidates.append((src, val))
+
+    tried = []
+    for src, ip in candidates:
+        if not port_open(ip):
+            tried.append(f"{ip} ({src})")
+            continue
+        host = identify(ip)
+        if host and host != "naoserver":
+            return {"ip": ip, "via": src, "host": host, "tried": tried}
+        tried.append(f"{ip} ({src}, {'is the Pi' if host == 'naoserver' else 'no ssh'})")
+
+    if scan:
+        prefix = local_subnet()
+        if prefix:
+            for ip in sweep(prefix):
+                if ip in seen:
+                    continue
+                host = identify(ip)
+                if host and host not in ("naoserver",) and "nao" in host.lower():
+                    return {"ip": ip, "via": "subnet scan", "host": host, "tried": tried}
+    return {"ip": None, "via": None, "host": None, "tried": tried}
+
+
+def find_pi() -> dict:
+    for src, val in (
+        ("mdns naoserver.local", mdns("naoserver.local")),
+        ("ssh config", ssh_config_host("naoserver")),
+        (".env PI_IP", env_value("PI_IP")),
+    ):
+        if val and port_open(val):
+            host = identify(val)
+            if host == "naoserver":
+                return {"ip": val, "via": src}
+    return {"ip": None, "via": None}
+
+
+# ---------------------------------------------------------------- collectors
+
+ROBOT_PROBE = r"""
+echo "uptime:$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
+echo "main:$(pgrep -f '[m]ain\.py' | head -1)"
+for c in "qicli call ALBattery.getBatteryCharge" \
+         "qicli call ALMemory.getData Device/SubDeviceList/Battery/Charge/Sensor/Value"; do
+  v=$($c 2>/dev/null | tr -d '\r' | tail -1)
+  if [ -n "$v" ]; then echo "battery:$v"; break; fi
+done
+echo "charging:$(qicli call ALMemory.getData Device/SubDeviceList/Battery/Charge/Sensor/Status 2>/dev/null | tr -d '\r' | tail -1)"
+echo "micraw:$(amixer -c 0 sget 'Numeric Left mics' 2>/dev/null | grep -oE ': Capture [0-9]+' | grep -oE '[0-9]+' | head -1)"
+echo "server:$(grep -oE 'SERVER_IP=[0-9.]+' /home/nao/launch_nao_assist.sh 2>/dev/null | head -1 | cut -d= -f2)"
+echo "log:$(ls -t /home/nao/nao_assist/logs/*.jsonl 2>/dev/null | head -1)"
+"""
+
+PI_PROBE = r"""
+echo "uptime:$(cut -d' ' -f1 /proc/uptime)"
+echo "active:$(systemctl is-active nao-server 2>/dev/null)"
+echo "started:$(systemctl show nao-server -p ExecMainStartTimestampMonotonic --value 2>/dev/null)"
+echo "restarts:$(systemctl show nao-server -p NRestarts --value 2>/dev/null)"
+echo "timer:$(systemctl is-active nao-autodeploy.timer 2>/dev/null)"
+echo "temp:$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)"
+echo "mem:$(free -m | awk '/^Mem:/{print $3"/"$2}')"
+echo "disk:$(df -h / | awk 'NR==2{print $3"/"$2" "$5}')"
+echo "load:$(cut -d' ' -f1 /proc/loadavg)"
+echo "git:$(git -C REPO log -1 --format='%h %cd %s' --date=short 2>/dev/null | cut -c1-58)"
+echo "ws:$(curl -s --max-time 4 http://localhost:5050/metrics 2>/dev/null | awk '/^nao_ws_connections_active/{print $2}')"
+# The journal is hundreds of MB. Read it newest-first and stop at the first
+# hit, or this single line takes longer than the whole probe's timeout.
+echo "lastturn:$(journalctl -u nao-server -o short-iso --no-pager -r 2>/dev/null | grep -m1 turn_complete | cut -d' ' -f1)"
+echo "today:$(journalctl -u nao-server -o short-iso --since today --no-pager 2>/dev/null | grep -c turn_complete)"
+echo "todayok:$(journalctl -u nao-server -o short-iso --since today --no-pager 2>/dev/null | grep turn_complete | grep -c 'outcome=ok')"
+""".replace("REPO", PI_REPO)
+
+
+def parse_kv(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def collect_robot(scan: bool) -> dict:
+    info = find_robot(scan)
+    if not info["ip"]:
+        return {"up": False, **info}
+    rc, out = ssh(f"nao@{info['ip']}", ROBOT_PROBE, timeout=20)
+    raw = parse_kv(out)
+    return {"up": bool(raw), "raw": raw, **info}
+
+
+def collect_pi() -> dict:
+    info = find_pi()
+    if not info["ip"]:
+        return {"up": False, **info}
+    rc, out = ssh(f"nao@{info['ip']}", PI_PROBE, timeout=25)
+    raw = parse_kv(out)
+    return {"up": bool(raw.get("uptime")), "raw": raw, **info}
+
+
+def collect_local() -> dict:
+    d = {}
+    rc, out = run(["git", "-C", str(REPO), "rev-parse", "--abbrev-ref", "HEAD"], timeout=6)
+    d["branch"] = out.strip() if rc == 0 else None
+    rc, out = run(["git", "-C", str(REPO), "log", "-1", "--format=%h %cd %s", "--date=short"], timeout=6)
+    d["head"] = out.strip()[:58] if rc == 0 else None
+    rc, out = run(["git", "-C", str(REPO), "status", "--porcelain"], timeout=8)
+    d["dirty"] = len([l for l in out.splitlines() if l.strip()]) if rc == 0 else None
+
+    pid_file = REPO / "logs" / "server.pid"
+    d["server"] = False
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)
+            d["server"] = True
+        except (ValueError, OSError):
+            d["server"] = False
+
+    venv = REPO / ".venv" / "bin" / "python"
+    d["venv"] = None
+    if venv.exists():
+        rc, out = run([str(venv), "-V"], timeout=8)
+        d["venv"] = out.strip() if rc == 0 else None
+    return d
+
+
+# ---------------------------------------------------------------- rendering
+
+def render_robot(r: dict) -> list[str]:
+    lines = []
+    if not r["up"]:
+        lines.append(rule(f"NAO robot  {badge('OFFLINE', C.red)}"))
+        lines.append(row("address", "not found on any known address", C.grey))
+        for t in r.get("tried", [])[:4]:
+            lines.append(row("", f"tried {t}", C.grey))
+        if not r.get("tried"):
+            lines.append(row("", "no candidate address in mDNS, ssh config or .env", C.grey))
+        lines.append(row("", "press the chest button -- NAO speaks its own IP", C.grey))
+        return lines
+
+    raw = r.get("raw", {})
+    lines.append(rule(f"NAO robot  {badge('ONLINE', C.green)}"))
+    lines.append(row("address", f"{r['ip']}  {C.grey}via {r['via']} -- hostname {r['host']}"))
+
+    batt = raw.get("battery", "")
+    try:
+        pct = float(batt)
+        if pct <= 1.0:            # the ALMemory key reports 0..1
+            pct *= 100
+        tone = C.green if pct >= 50 else C.yellow if pct >= 25 else C.red
+        charging = raw.get("charging", "")
+        tag = " charging" if charging and charging not in ("0", "") else ""
+        lines.append(row("battery", f"{bar(pct, 16, tone)} {tone}{pct:5.1f}%{C.reset}{C.grey}{tag}"))
+    except ValueError:
+        lines.append(row("battery", "-- (ALBattery did not answer)", C.grey))
+
+    try:
+        up = float(raw.get("uptime", ""))
+        lines.append(row("powered on", f"{ago(up)} ago"))
+    except ValueError:
+        lines.append(row("powered on", "--", C.grey))
+
+    main = raw.get("main", "")
+    if main:
+        lines.append(row("main.py", f"running  {C.grey}pid {main}", C.green))
+    else:
+        lines.append(row("main.py", "not running -- robot will not answer", C.red))
+
+    gain = raw.get("micraw", "")
+    if gain.isdigit():
+        g = int(gain)
+        tone = C.green if g >= 60 else C.red
+        note = "" if g >= 60 else "  <- too low, NAO will hear nothing"
+        lines.append(row("mic gain", f"{g}/88{C.reset}{tone}{note}", tone))
+    else:
+        lines.append(row("mic gain", "--", C.grey))
+
+    if raw.get("server"):
+        lines.append(row("points at", raw["server"]))
+    return lines
+
+
+def render_pi(p: dict) -> list[str]:
+    lines = []
+    if not p["up"]:
+        lines.append(rule(f"naoserver (Pi)  {badge('UNREACHABLE', C.red)}"))
+        lines.append(row("address", "naoserver.local did not resolve to a live host", C.grey))
+        return lines
+
+    raw = p.get("raw", {})
+    active = raw.get("active", "")
+    tone = C.green if active == "active" else C.red
+    lines.append(rule(f"naoserver (Pi)  {badge('UP', C.green)}"))
+    lines.append(row("address", f"{p['ip']}  {C.grey}via {p['via']}"))
+    lines.append(row("nao-server", f"{active or '--'}{C.reset}{C.grey}"
+                                   f"  restarts {raw.get('restarts', '--')}"
+                                   f"  autodeploy {raw.get('timer', '--')}", tone))
+
+    try:
+        lines.append(row("uptime", ago(float(raw.get("uptime", "")))))
+    except ValueError:
+        lines.append(row("uptime", "--", C.grey))
+
+    temp = raw.get("temp", "")
+    bits = []
+    if temp.isdigit():
+        c = int(temp) / 1000
+        bits.append(f"{C.green if c < 70 else C.yellow}{c:.1f}C{C.reset}")
+    if raw.get("load"):
+        bits.append(f"{C.grey}load {raw['load']}{C.reset}")
+    if raw.get("mem"):
+        bits.append(f"{C.grey}mem {raw['mem']}MB{C.reset}")
+    if raw.get("disk"):
+        bits.append(f"{C.grey}disk {raw['disk']}{C.reset}")
+    if bits:
+        lines.append(row("health", "  ".join(bits)))
+
+    ws = raw.get("ws", "")
+    try:
+        n = int(float(ws))
+        lines.append(row("live sockets", f"{n} open{'' if n else '  (nothing connected)'}",
+                         C.green if n else C.grey))
+    except ValueError:
+        pass
+
+    today, ok = raw.get("today", "0"), raw.get("todayok", "0")
+    if today.isdigit() and int(today):
+        lines.append(row("turns today", f"{today}  {C.grey}{ok} answered"))
+    else:
+        lines.append(row("turns today", "none", C.grey))
+
+    if raw.get("lastturn"):
+        lines.append(row("last turn", raw["lastturn"]))
+    if raw.get("git"):
+        lines.append(row("deployed", raw["git"], C.grey))
+    return lines
+
+
+def render_local(l: dict, pi: dict) -> list[str]:
+    lines = [rule("this laptop")]
+    srv = l.get("server")
+    lines.append(row("dev server", "running on this Mac" if srv else "not running",
+                     C.green if srv else C.grey))
+    if l.get("branch"):
+        dirty = l.get("dirty") or 0
+        tail = f"  {C.yellow}{dirty} uncommitted{C.reset}" if dirty else ""
+        lines.append(row("branch", f"{l['branch']}{C.reset}{tail}"))
+    if l.get("head"):
+        lines.append(row("head", l["head"], C.grey))
+    if l.get("venv"):
+        lines.append(row("venv", l["venv"], C.grey))
+
+    # Deployed-vs-local drift is the failure that looks like a broken robot.
+    pi_git = (pi.get("raw") or {}).get("git", "")
+    if pi_git and l.get("head"):
+        if pi_git.split()[0] != l["head"].split()[0]:
+            lines.append(row("drift", f"Pi serves {pi_git.split()[0]}, local is "
+                                      f"{l['head'].split()[0]}", C.yellow))
+    return lines
+
+
+def render(robot: dict, pi: dict, local: dict) -> str:
+    out = []
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    out.append(f"{C.bold}{C.cyan}NAO fleet{C.reset}  {C.grey}{stamp}{C.reset}")
+    out.append("")
+    out += render_robot(robot)
+    out.append("")
+    out += render_pi(pi)
+    out.append("")
+    out += render_local(local, pi)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- entrypoint
+
+def probe(scan: bool) -> str:
+    with futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_robot = pool.submit(collect_robot, scan)
+        f_pi = pool.submit(collect_pi)
+        f_local = pool.submit(collect_local)
+        return render(f_robot.result(), f_pi.result(), f_local.result())
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="One-screen NAO fleet diagnostics.")
+    ap.add_argument("--watch", nargs="?", const=10, type=int, metavar="SECS",
+                    help="refresh every SECS seconds (default 10) until Ctrl-C")
+    ap.add_argument("--scan", action="store_true",
+                    help="sweep the local /24 for the robot when known addresses miss")
+    ap.add_argument("--no-color", action="store_true", help="plain text output")
+    args = ap.parse_args()
+
+    if args.no_color:
+        C.on = False
+        for k in ("reset", "dim", "bold", "red", "green", "yellow", "blue", "cyan", "grey"):
+            setattr(C, k, "")
+
+    if not args.watch:
+        print(probe(args.scan))
+        return 0
+
+    try:
+        while True:
+            text = probe(args.scan)
+            print("\033[H\033[J" if C.on else "\n" + "=" * width())
+            print(text)
+            print(f"\n{C.grey}refreshing every {args.watch}s -- Ctrl-C to stop{C.reset}")
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
