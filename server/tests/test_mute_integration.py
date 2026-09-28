@@ -211,3 +211,64 @@ class TestSystemLineEchoGuard:
     def test_empty_and_tiny_inputs_are_safe(self):
         for t in ("", "   ", "hi", "mute", "nao mute"):
             assert app_ws._is_system_line_echo(t) is False
+
+
+class TestListenerDoesNotBlockTheEventLoop:
+    """The mute listener must do all blocking work on a worker thread.
+
+    Shipped 2026-09-04 with `_write_pcm_to_wav` and `has_voice` called
+    straight from the coroutine, so every listener window stalled the whole
+    server -- WebSocket reads included. On an idle Pi (load 0.9 / 4 cores,
+    40 C, no throttling) the purely-CPU `vad` phase went from ~11-56 ms to
+    p50 230 ms, max 3021 ms.
+    """
+
+    def test_all_blocking_work_is_offloaded(self):
+        import inspect
+        src = inspect.getsource(app_ws._feed_mute_listener)
+        check = src[src.index("async def _check"):]
+        for blocking in ("_write_pcm_to_wav(", "has_voice("):
+            assert blocking not in check, (
+                "%s runs on the event loop inside _check; it belongs in the "
+                "to_thread helper" % blocking
+            )
+
+    def test_helper_does_the_blocking_work(self):
+        import inspect
+        src = inspect.getsource(app_ws._feed_mute_listener)
+        helper = src[src.index("def _transcribe_window"):src.index("async def _check")]
+        assert "_write_pcm_to_wav(" in helper
+        assert "has_voice(" in helper
+        assert "transcribe(" in helper
+
+
+class TestTempWavLocation:
+    """Per-turn WAVs should avoid the SD card where tmpfs exists.
+
+    Both the turn path and the mute listener write a WAV per window; on the
+    Pi `/tmp` is the SD card, and the concurrent small writes contended.
+    Also spares the card write cycles -- corruption has downed this Pi.
+    """
+
+    def test_prefers_tmpfs_when_present(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(app_ws.os.path, "isdir",
+                            lambda p: p == "/dev/shm")
+        monkeypatch.setattr(app_ws.os, "access", lambda p, m: p == "/dev/shm")
+        assert app_ws._pick_tmp_dir() == "/dev/shm"
+
+    def test_falls_back_when_no_tmpfs(self, monkeypatch):
+        # The Mac has no /dev/shm; must return None so tempfile uses its
+        # own default rather than raising.
+        monkeypatch.setattr(app_ws.os.path, "isdir", lambda p: False)
+        assert app_ws._pick_tmp_dir() is None
+
+    def test_write_still_produces_a_readable_wav(self):
+        import wave
+        path = app_ws._write_pcm_to_wav(b"\x00\x01" * 8000)
+        try:
+            with wave.open(path, "rb") as w:
+                assert w.getnchannels() == 1
+                assert w.getframerate() == app_ws._WS_AUDIO_SR
+                assert w.getnframes() == 8000
+        finally:
+            app_ws.os.unlink(path)

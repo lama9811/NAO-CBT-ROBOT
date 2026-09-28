@@ -965,6 +965,31 @@ _WS_AUDIO_SR = 16_000
 _WS_AUDIO_BYTES_PER_FRAME = 2  # PCM16 mono
 
 
+def _pick_tmp_dir() -> str | None:
+    """Prefer a RAM-backed dir for the per-turn WAVs; None means system default.
+
+    On the Pi `/tmp` lives on the SD card (`/dev/mmcblk0p2`, ext4). Every turn
+    writes a WAV there, and the spoken-mute listener writes another for each
+    ~1.2 s window while Nao speaks -- so the write rate roughly doubled on
+    2026-09-04. SD cards serialise small concurrent writes badly, which showed
+    up as the `vad` phase (a synchronous write + WebRTC VAD) going from ~11-56
+    ms to p50 230 ms / max 3021 ms on an otherwise idle box.
+
+    `/dev/shm` is tmpfs, already mounted, and was sitting at 0% of 3.9 GB.
+    Writing there removes the contention and, just as usefully, stops burning
+    SD-card write cycles on throwaway audio -- card corruption has taken this
+    Pi down before. Falls back to the default when tmpfs is absent (e.g. the
+    Mac), so behaviour elsewhere is unchanged.
+    """
+    for cand in ("/dev/shm", "/run/shm"):
+        if os.path.isdir(cand) and os.access(cand, os.W_OK):
+            return cand
+    return None
+
+
+_TMP_DIR = _pick_tmp_dir()
+
+
 def _write_pcm_to_wav(pcm: bytes, sr: int = _WS_AUDIO_SR) -> str:
     """Bundle the accumulated PCM bytes into a temp WAV file the legacy
     pipeline can consume.
@@ -974,7 +999,7 @@ def _write_pcm_to_wav(pcm: bytes, sr: int = _WS_AUDIO_SR) -> str:
     wraps the buffered chunks into a one-shot WAV per turn.
     """
     import wave
-    fd, path = tempfile.mkstemp(suffix=".wav", prefix="ws_turn_")
+    fd, path = tempfile.mkstemp(suffix=".wav", prefix="ws_turn_", dir=_TMP_DIR)
     try:
         os.close(fd)
         with wave.open(path, "wb") as w:
@@ -1162,13 +1187,31 @@ async def _feed_mute_listener(ws: WebSocket, sess: "_Session",
     del sess.mute_buf[:-_MUTE_WINDOW_OVERLAP_BYTES]
     sess._mute_check_running = True
 
-    async def _check() -> None:
-        wav_path = None
+    def _transcribe_window() -> str:
+        """Everything blocking, on a worker thread. Returns "" for silence.
+
+        `_write_pcm_to_wav` writes to the SD card and `has_voice` runs
+        WebRTC VAD; both are synchronous. Calling them straight from the
+        coroutine ran them ON the event loop, so every listener window
+        stalled the whole server -- WebSocket reads included -- and made
+        even pure-CPU phases look slow on a completely idle Pi (`vad` p50
+        230 ms, max 3021 ms, load 0.9 across 4 cores). Only `transcribe`
+        was ever offloaded.
+        """
+        wav_path = _write_pcm_to_wav(window)
         try:
-            wav_path = _write_pcm_to_wav(window)
             if not legacy.has_voice(wav_path):
-                return
-            text = await asyncio.to_thread(legacy.transcribe, wav_path)
+                return ""
+            return legacy.transcribe(wav_path) or ""
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+    async def _check() -> None:
+        try:
+            text = await asyncio.to_thread(_transcribe_window)
             if not text:
                 return
             command = mute_words.classify_with_echo(
@@ -1195,12 +1238,9 @@ async def _feed_mute_listener(ws: WebSocket, sess: "_Session",
                 user=sess.username, error=repr(exc),
             )
         finally:
+            # The wav is created and removed inside `_transcribe_window`,
+            # so there is nothing to clean up out here any more.
             sess._mute_check_running = False
-            if wav_path:
-                try:
-                    os.unlink(wav_path)
-                except OSError:
-                    pass
 
     asyncio.create_task(_check())
 
