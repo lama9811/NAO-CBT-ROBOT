@@ -218,6 +218,27 @@ def _ingest_event(ev: dict[str, Any]) -> None:
             })
 
 
+def install_log_hook() -> None:
+    """Insert :func:`capture` into the *active* structlog chain.
+
+    ``logging_setup.configure_logging`` is never called by the server, so
+    the Pi runs structlog's default chain; the hook must be added to
+    whatever chain is live, just before its renderer. Idempotent, and it
+    leaves the log format exactly as it was.
+    """
+    try:
+        import structlog
+        procs = list(structlog.get_config().get("processors") or [])
+        if any(getattr(p, "__name__", "") in ("capture", "_dashboard_capture")
+               for p in procs):
+            return
+        insert_at = max(len(procs) - 1, 0)  # before the renderer
+        procs.insert(insert_at, capture)
+        structlog.configure(processors=procs)
+    except Exception:  # noqa: BLE001 -- never break logging for a dashboard
+        pass
+
+
 # ───────────────────────── robot + connections ────────────────────────────
 def robot_connected(ip: str | None) -> None:
     with _lock:

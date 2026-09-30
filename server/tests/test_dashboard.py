@@ -105,3 +105,20 @@ def test_warnings_become_problems_but_listener_noise_does_not():
     d.capture(None, "debug", {"event": "mute_listener_no_match", "level": "warning"})
     probs = d.snapshot()["problems"]
     assert [p["event"] for p in probs] == ["agent_stream_error"]
+
+
+def test_hook_is_live_under_the_default_structlog_chain():
+    """The server never calls configure_logging, so the hook has to join the
+    default chain; turns logged through structlog must reach the dashboard."""
+    import structlog
+    structlog.reset_defaults()
+    d.install_log_hook()
+    d.install_log_hook()  # idempotent
+    names = [getattr(p, "__name__", "") for p in structlog.get_config()["processors"]]
+    assert names.count("capture") == 1
+    log = structlog.get_logger()
+    log.info("stt_legacy", session_id="h1", transcript="Who teaches COSC 220?")
+    log.info("turn_complete", session_id="h1", outcome="ok",
+             active_agent="cs_direct", reply_preview="Jin Guo.")
+    assert d.snapshot()["turns"][0]["question"] == "Who teaches COSC 220?"
+    structlog.reset_defaults()

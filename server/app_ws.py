@@ -954,9 +954,13 @@ app = FastAPI(
 )
 
 
-from server.dashboard import router as _dashboard_router  # noqa: E402
+from server.dashboard import (  # noqa: E402
+    install_log_hook as _install_dashboard_log_hook,
+    router as _dashboard_router,
+)
 
 app.include_router(_dashboard_router)
+_install_dashboard_log_hook()
 
 
 @app.get("/health")
