@@ -156,6 +156,41 @@ def classify(transcript: str) -> str | None:
     return None
 
 
+# Extra ways people say "talk again", accepted only while NAO is muted.
+_UNMUTE_WHILE_MUTED = _UNMUTE_PHRASES + (
+    "talk now",
+    "speak now",
+    "you can continue",
+    "go ahead",
+    "resume",
+    # How Deepgram tends to hear "unmute". Saying "on mute" to a robot
+    # that is already muted can only mean "unmute", so it is safe here and
+    # nowhere else.
+    "on mute",
+    "and mute",
+    "an mute",
+)
+
+
+def classify_while_muted(transcript: str) -> str | None:
+    """Forgiving unmute check, for use only while NAO is muted.
+
+    The normal matcher caps a command at four words so a sentence that just
+    mentions "mute" does not trigger. That also rejected the real attempt
+    "You know, you can talk now." (six words) on 2026-09-30, leaving NAO
+    stuck silent. While muted, a false unmute costs one reply, while a
+    missed one leaves the robot unusable, so any utterance containing an
+    unmute phrase counts, at any length.
+    """
+    norm = _strip_address(_normalize(transcript))
+    if not norm:
+        return None
+    for p in _UNMUTE_WHILE_MUTED:
+        if re.search(r"\b%s\b" % re.escape(p), norm):
+            return "unmute"
+    return None
+
+
 def is_self_trigger(command: str, spoken_text: str) -> bool:
     """True when NAO's *own* reply contains the command word.
 

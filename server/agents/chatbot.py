@@ -6,34 +6,21 @@ service (see ``docs/PHASE_5_TASK_MAP.md``). The new tool returns one clean,
 already-RAG-enriched answer string instead of raw passages, so the agent's
 job shrinks to: ask CS Navigator, then re-voice the reply for NAO.
 
-Robustness during the staged rollout: ``server.tools.cs_navigator`` lands in
-a parallel worktree (``cs-navigator-tool``). If it is not present at import
-time, fall back to the legacy ``vertex_search`` tool (which itself replaced
-Pinecone earlier on this branch) so the agent keeps working. ``vertex_search``
-is marked deprecated and stays parked for one phase per the PRD before
-deletion.
+CS Navigator is the only knowledge source. The old in-process Vertex AI
+Search fallback was removed on 2026-09-30: it only ran if this import failed,
+and it had not run once that month.
 """
 from agents import Agent, ModelSettings
 from server import config
 from server.model_factory import resolve_model
 from server.agents._memory_inject import with_memory_preamble
 
-# Prefer the CS Navigator tool. If the cs-navigator-tool worktree hasn't been
-# merged yet, fall back to the legacy vertex_search tool so the chatbot agent
-# still runs end-to-end (see Phase 5 task map: "may not be merged yet in your
-# worktree; guard import with try/except").
-try:
-    from server.tools.cs_navigator import cs_navigator_search as _SEARCH_TOOL  # type: ignore[import-not-found]
-    _SEARCH_TOOL_NAME = "cs_navigator_search"
-    _USING_CS_NAVIGATOR = True
-except Exception:  # noqa: BLE001 — any import failure (missing module, missing dep) falls back
-    from server.tools.vertex_search import vertex_search as _SEARCH_TOOL
-    _SEARCH_TOOL_NAME = "vertex_search"
-    _USING_CS_NAVIGATOR = False
+from server.tools.cs_navigator import cs_navigator_search as _SEARCH_TOOL
+
+_SEARCH_TOOL_NAME = "cs_navigator_search"
 
 
-# Agent prompt. Tool name is interpolated so the same template works for the
-# CS Navigator path and the vertex_search fallback. We deliberately don't
+# Agent prompt. We deliberately don't
 # mention "embeddings", "Pinecone", "Vertex", or "RAG" — those are
 # implementation details the user-facing voice should never leak.
 SYSTEM = (

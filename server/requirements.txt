@@ -18,7 +18,6 @@ openai-agents>=0.13.6,<0.18
 # 2.36.0/0.17.1, both working. An exact pin would silently downgrade whichever
 # machine did not match next time its venv was rebuilt.
 openai>=2.26.0,<2.37
-google-cloud-discoveryengine>=0.13.0
 # Legacy Flask transport (kept under USE_WS=0 for the deployment-week per PRD v2)
 flask==3.0.3
 werkzeug==3.0.3

@@ -228,8 +228,7 @@ def test_first_turn_announce_text_is_expected_string():
             "(owned by sibling Phase 6 camera-consent agent)"
         )
 
-    expected = (
-        "Heads up — my camera is on for this conversation. "
-        "Say 'stop watching me' anytime."
-    )
+    # Reworded 2026-09-30: the old "Say 'stop watching me' anytime" was
+    # itself a camera-off command, and NAO hears its own speaker.
+    expected = "Heads up, my camera is on for this conversation."
     assert config.CAMERA_ANNOUNCE_TEXT == expected

@@ -40,6 +40,15 @@ class FakeWS:
                 if isinstance(f, dict) and f.get("subtype") == subtype]
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_tts(monkeypatch):
+    """Mute/unmute now speak a confirmation; never hit a real TTS API."""
+    monkeypatch.setattr(app_ws, "_synth_for", lambda *a, **k: b"\x01mp3")
+
+
 def _session(username="tester"):
     return app_ws._Session(username)
 
@@ -272,3 +281,48 @@ class TestTempWavLocation:
                 assert w.getnframes() == 8000
         finally:
             app_ws.os.unlink(path)
+
+
+class TestSpokenConfirmation:
+    """Requested 2026-09-30: say "Okay, my lips are closed now." on mute and
+    "I'm back." on unmute, so the user knows the command landed."""
+
+    def _spoken(self, ws):
+        return [f["text"] for f in ws.sent
+                if isinstance(f, dict) and f.get("type") == "audio_chunk"]
+
+    def test_mute_says_lips_closed_even_though_muted(self):
+        ws, sess = FakeWS(), _session()
+        asyncio.run(app_ws._handle_mute_command(ws, sess, "Nao, be quiet"))
+        assert sess.muted is True
+        assert self._spoken(ws) == [app_ws.MUTE_ACK]
+        assert app_ws.MUTE_ACK == "Okay, my lips are closed now."
+
+    def test_unmute_says_im_back(self):
+        ws, sess = FakeWS(), _session()
+        sess.muted = True
+        asyncio.run(app_ws._handle_mute_command(ws, sess, "you can talk"))
+        assert sess.muted is False
+        assert self._spoken(ws) == ["I'm back."]
+
+    def test_no_confirmation_when_nothing_changed(self):
+        ws, sess = FakeWS(), _session()
+        sess.muted = True
+        asyncio.run(app_ws._handle_mute_command(ws, sess, "mute"))
+        assert self._spoken(ws) == []
+
+    def test_confirmation_is_not_heard_as_user_speech(self):
+        ws, sess = FakeWS(), _session()
+        asyncio.run(app_ws._handle_mute_command(ws, sess, "be quiet"))
+        echo = "Okay, my lips are closed now."
+        assert (app_ws._is_system_line_echo(echo)
+                or app_ws._is_substring_or_sentence_echo(sess.username, echo))
+
+    def test_mute_state_changes_before_speaking(self):
+        """The control frame must reach the robot before the ack audio, so
+        the robot's player stop does not cut the confirmation off."""
+        ws, sess = FakeWS(), _session()
+        asyncio.run(app_ws._handle_mute_command(ws, sess, "be quiet"))
+        kinds = [f.get("subtype") or f.get("type") for f in ws.sent
+                 if isinstance(f, dict)]
+        assert kinds.index("mute") < kinds.index("audio_chunk")

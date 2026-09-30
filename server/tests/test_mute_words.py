@@ -128,3 +128,33 @@ class TestEchoStrippedCommands:
         # strip, so there is no command to act on.
         reply = "Sure, I can put myself on mute whenever you like"
         assert mute_words.classify_with_echo(reply, reply) is None
+
+
+# ── 2026-09-30: unmute must be forgiving while muted ──────────────────────
+import pytest
+from server.mute_words import classify_while_muted
+
+
+def test_real_failed_unmute_attempt_now_works():
+    # Heard on the robot right after "be quiet"; six words, so the strict
+    # matcher ignored it and NAO stayed silent.
+    assert classify_while_muted("You know, you can talk now.") == "unmute"
+
+
+@pytest.mark.parametrize("heard", [
+    "unmute", "Nao, unmute.", "On mute.", "and mute", "okay you can speak",
+    "resume", "go ahead", "talk now please", "Nao you can talk again now"])
+def test_unmute_variants_while_muted(heard):
+    assert classify_while_muted(heard) == "unmute"
+
+
+@pytest.mark.parametrize("heard", [
+    "Hey. How are you?", "No.", "mute", "be quiet", ""])
+def test_ordinary_speech_does_not_unmute(heard):
+    assert classify_while_muted(heard) is None
+
+
+def test_strict_matcher_unchanged_when_not_muted():
+    from server.mute_words import classify
+    assert classify("You know, you can talk now.") is None
+    assert classify("on mute") == "mute"

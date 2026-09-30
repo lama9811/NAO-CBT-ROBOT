@@ -115,11 +115,6 @@ USE_OPENAI_TTS = os.environ.get("USE_OPENAI_TTS", "1") == "1"
 # OPEN mode for local dev — server logs a warning at startup.
 NAO_SHARED_SECRET = os.environ.get("NAO_SHARED_SECRET", "")
 
-# Vertex AI Search (Morgan State CS knowledge base)
-GOOGLE_CLOUD_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "csnavigator-vertex-ai")
-VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "us")
-VERTEX_DATASTORE_ID = os.environ.get("VERTEX_DATASTORE_ID", "csnavigator-kb-v7")
-
 # Networking
 NAO_IP = os.environ.get("NAO_IP", "172.20.95.111")
 NAO_PORT = int(os.environ.get("NAO_PORT", "9559"))
@@ -199,15 +194,21 @@ WS_RECONNECT_BACKOFF_MS = [
 # the operator's deployed Cloud Run FastAPI ("CS Navigator") for any Morgan
 # State CS knowledge query. See docs/PHASE_5_TASK_MAP.md for the contract.
 #
-# CS_NAVIGATOR_URL — Cloud Run base URL, no trailing slash. Empty string
-#                    means the chatbot agent will short-circuit and apologize.
+# CS_NAVIGATOR_URL — Cloud Run base URL, no trailing slash. Defaults to the
+#                    public CS Navigator backend (guest endpoint, no token), so
+#                    a machine whose .env lacks the line still answers CS
+#                    questions; it was empty on the Pi until 2026-07-30 and
+#                    every CS question failed quietly. Set to "" to disable.
 # CS_NAVIGATOR_TOKEN — optional bearer token. When empty the tool POSTs to
 #                    `/chat/guest`; when set it POSTs to `/chat/stream` with
 #                    `Authorization: Bearer <TOKEN>`.
 # CS_NAVIGATOR_TIMEOUT_S — request timeout (seconds). Float so tests can
 #                    bypass with sub-second values; production stays at 30 s
 #                    to absorb cold starts on the Cloud Run side.
-CS_NAVIGATOR_URL = os.environ.get("CS_NAVIGATOR_URL", "")
+CS_NAVIGATOR_URL = os.environ.get(
+    "CS_NAVIGATOR_URL",
+    "https://csnavigator-backend-900141432581.us-central1.run.app",
+)
 CS_NAVIGATOR_TOKEN = os.environ.get("CS_NAVIGATOR_TOKEN", "")
 CS_NAVIGATOR_TIMEOUT_S = float(os.environ.get("CS_NAVIGATOR_TIMEOUT_S", "30"))
 
@@ -227,6 +228,8 @@ CAMERA_DEFAULT_ON = os.environ.get("CAMERA_DEFAULT_ON", "1") == "1"
 # session opens with `camera_consent=1`. Plain text — TTS-only, no SSML.
 CAMERA_ANNOUNCE_TEXT = os.environ.get(
     "CAMERA_ANNOUNCE_TEXT",
-    "Heads up — my camera is on for this conversation. "
-    "Say 'stop watching me' anytime.",
+    # Must NOT contain a camera-off trigger phrase (motion_trigger.py): NAO
+    # hears its own speaker, and the old wording "Say 'stop watching me'
+    # anytime" made NAO switch its own camera off by hearing itself.
+    "Heads up, my camera is on for this conversation.",
 )

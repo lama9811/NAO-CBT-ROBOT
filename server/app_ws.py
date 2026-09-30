@@ -770,6 +770,25 @@ def _reset_reply_chunks(username: str, full_reply: str) -> None:
 # watching me anytime", matched the `disable_camera` trigger. Nao switched
 # its own camera off. A stateless check on known lines closes that class of
 # failure rather than the one instance.
+def _echo_tokens(text: str) -> list[str]:
+    """Lowercase word tokens for the echo guards.
+
+    Keeps apostrophes inside words ("don't", "i'm") but strips them from the
+    ends. Without that, quoted text like "Say 'stop watching me' anytime"
+    tokenizes to "'stop" and "me'", which never match the transcript's
+    "stop" and "me" -- on 2026-09-30 that dropped NAO's own echoed camera
+    announcement under both guards' thresholds and it switched its camera
+    off. Curly quotes are folded to straight ones first.
+    """
+    t = (text or "").lower().replace("\u2019", "'").replace("\u2018", "'")
+    out = []
+    for tok in re.findall(r"[a-z0-9']+", t):
+        tok = tok.strip("'")
+        if tok:
+            out.append(tok)
+    return out
+
+
 _SYSTEM_LINE_MIN_TOKENS = 5
 _SYSTEM_LINE_OVERLAP = 0.75
 _SYSTEM_LINE_CACHE: list[set[str]] | None = None
@@ -787,12 +806,14 @@ def _system_spoken_lines() -> list[set[str]]:
         for src in (
             getattr(config, "CAMERA_ANNOUNCE_TEXT", ""),
             globals().get("_CAMERA_ANNOUNCE_FALLBACK", ""),
+            globals().get("_CAMERA_ANNOUNCE_LEGACY", ""),
             globals().get("_ONBOARDING_NAME_PROMPT", ""),
             globals().get("_ONBOARDING_NAME_RETRY", ""),
             globals().get("_ONBOARDING_GREETING", ""),
+            globals().get("MUTE_ACK", ""),
             getattr(safety, "HOTLINE_REPLY", ""),
         ):
-            toks = set(re.findall(r"[a-z0-9']+", str(src or "").lower()))
+            toks = set(_echo_tokens(str(src or "")))
             if len(toks) >= _SYSTEM_LINE_MIN_TOKENS:
                 out.append(toks)
         _SYSTEM_LINE_CACHE = out
@@ -808,7 +829,7 @@ def _is_system_line_echo(transcript: str) -> bool:
     start eating the very instructions the announcement is telling people
     to say.
     """
-    toks = set(re.findall(r"[a-z0-9']+", (transcript or "").lower()))
+    toks = set(_echo_tokens(transcript))
     if len(toks) < _SYSTEM_LINE_MIN_TOKENS:
         return False
     for line in _system_spoken_lines():
@@ -841,8 +862,8 @@ def _is_substring_or_sentence_echo(username: str, transcript: str) -> bool:
     # inside "now". Single- and two-word answers are left to the token-overlap
     # pass below, which still catches a genuine short echo.
     if full:
-        nt_seq = re.findall(r"[a-z0-9']+", nt)
-        full_seq = re.findall(r"[a-z0-9']+", full)
+        nt_seq = _echo_tokens(nt)
+        full_seq = _echo_tokens(full)
         if nt_seq and (nt_seq == full_seq
                        or (len(nt_seq) >= _ECHO_MIN_CONTAIN_TOKENS
                            and _is_token_subsequence(nt_seq, full_seq))):
@@ -851,11 +872,11 @@ def _is_substring_or_sentence_echo(username: str, transcript: str) -> bool:
     # Token-overlap against each individual sentence — protects against the
     # case where the transcript echoes one sentence but the joined string
     # is too long for a substring hit.
-    nt_tokens = set(re.findall(r"[a-z0-9']+", nt))
+    nt_tokens = set(_echo_tokens(nt))
     if not nt_tokens:
         return False
     for sent in _LAST_REPLY_CHUNKS.get(username, []):
-        sent_tokens = set(re.findall(r"[a-z0-9']+", sent.lower()))
+        sent_tokens = set(_echo_tokens(sent))
         if not sent_tokens:
             continue
         smaller = min(len(nt_tokens), len(sent_tokens))
@@ -1263,7 +1284,13 @@ async def _handle_mute_command(ws: WebSocket, sess: "_Session",
     # Nao's own echoed reply -- one long transcript that the four-word cap
     # in `classify` rejects outright. See `strip_leading_echo`.
     echo_source = _LAST_REPLY_FULL.get(sess.username, "") or sess.speaking_text
-    command = mute_words.classify_with_echo(transcript, echo_source)
+    command = None
+    if sess.muted:
+        # While muted, accept an unmute phrase anywhere in the utterance
+        # ("You know, you can talk now." used to be ignored for length).
+        command = mute_words.classify_while_muted(transcript)
+    if command is None:
+        command = mute_words.classify_with_echo(transcript, echo_source)
     if command is None:
         return False
 
@@ -1298,7 +1325,38 @@ async def _handle_mute_command(ws: WebSocket, sess: "_Session",
     await _send_json(ws, _control_frame(
         "transcript", transcript=transcript, reject_reason="mute_command",
     ))
+    # Spoken confirmation, only when the state actually changed. The mute
+    # ack must be forced through: the session is already muted, and
+    # without it the user cannot tell the command landed.
+    if was_muted != sess.muted:
+        await _speak_mute_ack(
+            ws, sess, MUTE_ACK if sess.muted else UNMUTE_ACK,
+            force=sess.muted)
     return True
+
+
+MUTE_ACK = os.environ.get("MUTE_ACK", "Okay, my lips are closed now.")
+UNMUTE_ACK = os.environ.get("UNMUTE_ACK", "I'm back.")
+
+
+async def _speak_mute_ack(ws: WebSocket, sess: "_Session", text: str,
+                          force: bool) -> None:
+    """Say a short fixed line and register it with the echo guards."""
+    try:
+        mp3 = await asyncio.to_thread(
+            _synth_for, sess.username, text, sess.voice_profile_override)
+    except Exception as exc:  # noqa: BLE001 -- the command already worked
+        logger.warning("mute_ack_tts_failed", user=sess.username,
+                       error=repr(exc))
+        return
+    if not mp3:
+        return
+    _reset_reply_chunks(sess.username, text)
+    await _send_audio_chunk(
+        ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3), force=force)
+    legacy.LAST_REPLY[sess.username] = text
+    _arm_post_tts_cooldown(sess)
+    await _send_json(ws, _control_frame("tts_ended", sentences=1))
 
 
 # ───────── per-session state ─────────
@@ -1679,6 +1737,85 @@ def _persist_voice_profile(sess: _Session, profile: str) -> None:
     )
 
 
+async def _apply_speaker_identified(sess: "_Session",
+                                    data: dict[str, Any]) -> None:
+    """Switch the conversation to whoever NAO just turned toward.
+
+    The robot re-scans the face after every turn toward a new voice. Until
+    2026-09-30 identity was fixed at wake -- and `user_identified` is
+    deliberately sticky -- so once NAO matched "Mason" it called every
+    later speaker Mason, including a different person entirely.
+
+    * Face not visible: we cannot tell who is talking; change nothing.
+    * Recognised name: that person's name, history and memory.
+    * Unknown face: anonymous guest, so no name is used and the previous
+      person's history and memories leave the model's context.
+
+    This never merges histories (no `migrate_username`): one person's
+    therapy transcript must not flow into another's.
+    """
+    if not bool(data.get("face_visible")):
+        logger.info("speaker_identified_ignored", user=sess.username,
+                    session_id=sess.session_id, reason="no_face")
+        return
+    name = (data.get("name") or "").strip() or None
+    if name and name.lower() in {"guest", "unknown"}:
+        name = None
+    prev = _IDENTIFIED_USERS.get(sess.session_id) or {}
+    prev_name = (prev.get("name") or "").strip() or None
+    if not prev.get("recognized"):
+        prev_name = None
+    if (name or "").lower() == (prev_name or "").lower():
+        return
+    _rebind_username(sess, name or "guest")
+    _IDENTIFIED_USERS[sess.session_id] = {
+        "name": name,
+        "recognized": bool(name),
+        "face_visible": True,
+        "ts": time.time(),
+        # Greet a recognised newcomer by name once; an unknown one just
+        # gets answered.
+        "greeted": not bool(name),
+        "prompted": True,
+    }
+    sess.asking_name = False
+    logger.info("speaker_changed", session_id=sess.session_id,
+                previous=prev_name, current=name, user=sess.username)
+
+
+async def _camera_allowed(sess: "_Session") -> bool:
+    """Persisted camera consent for this session's user. Fails OPEN only
+    if the DB itself is unreadable, matching the Phase 6 default-on policy."""
+    try:
+        from server import session as _session
+        return bool(await asyncio.to_thread(
+            _session.get_camera_consent, sess.username))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("camera_consent_read_failed",
+                       user=sess.username, error=repr(e))
+        return True
+
+
+async def _apply_camera_choice(ws: WebSocket, sess: "_Session", on: bool,
+                               source: str) -> None:
+    """Save a camera on/off choice and push it to the robot."""
+    try:
+        from server import session as _session
+        await asyncio.to_thread(_session.set_camera_consent, sess.username, on)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("camera_consent_write_failed",
+                       user=sess.username, on=on, error=repr(e))
+    if not on:
+        sess.image_b64 = None
+        _cancel_pending_vision(sess)
+    try:
+        await _send_json(ws, _control_frame("camera_state", on=on))
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("camera_state_set", user=sess.username,
+                session_id=sess.session_id, on=on, source=source)
+
+
 async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
                        motion: motion_trigger.MotionMatch,
                        phase_ms: dict[str, float]) -> None:
@@ -1725,6 +1862,14 @@ async def _emit_motion(ws: WebSocket, sess: _Session, transcript: str,
                         "learn_face_upsert_failed",
                         user=sess.username, name=learned, error=repr(exc),
                     )
+        # Camera on/off by voice. Until 2026-09-30 this path only sent the
+        # action to the robot, which had no handler for it ("unknown
+        # action"), and never saved the choice -- so NAO said "Camera off."
+        # and kept sending a photo after every reply. Persist first, drop
+        # any frame already stashed, and tell the robot explicitly.
+        if motion.action in ("disable_camera", "enable_camera"):
+            await _apply_camera_choice(
+                ws, sess, motion.action == "enable_camera", source="voice")
         # Action FIRST so the robot can begin the gesture as the ack starts.
         # The voice-profile branch above doesn't have a robot-side action;
         # it's a server-state flip.
@@ -1758,12 +1903,13 @@ _ONBOARDING_NAME_PROMPT = "Hi, I'm NAO. What should I call you?"
 # answers -- it does not interrogate the visitor for a name first. Asking
 # first meant anyone who opened with a question got the question ignored
 # and the name prompt repeated at them instead.
-_ONBOARDING_GREETING = "Hey, I'm NAO. How can I help you?"
+_ONBOARDING_GREETING = "Hi, I'm NAO. How can I help you today?"
 
-# Nao says nothing on wake by default -- no introduction, no name request.
-# It just listens and answers. Set WAKE_GREETING=1 to bring the spoken
-# greeting back.
-_WAKE_GREETING = os.environ.get("WAKE_GREETING", "0") == "1"
+# On wake Nao introduces itself ("Hi, I'm NAO. How can I help you today?")
+# and then just answers -- no name request. On by default since
+# 2026-09-30 at the user's request; the camera heads-up plays first.
+# Set WAKE_GREETING=0 to wake silently.
+_WAKE_GREETING = os.environ.get("WAKE_GREETING", "1") == "1"
 
 # Set ASK_NAME_ON_WAKE=1 to restore the old "what should I call you?" gate.
 # Off by default: enrolment is not worth blocking the first answer on, and
@@ -1787,6 +1933,7 @@ _ONBOARDING_ECHO_PATTERNS = (
     re.compile(r"\bi(?:'m| am)\s+nao\b"),
     re.compile(r"my camera is on for this conversation"),
     re.compile(r"say stop watching me"),
+    re.compile(r"rather i didn'?t watch"),
     re.compile(r"heads up"),
 )
 
@@ -2618,6 +2765,12 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     # eat 2 s for nothing. Skip the kickoff entirely so the prompt
     # sees vision_status=skipped (its safety rule kicks in).
     image_b64 = sess.image_b64
+    # A frame stashed before the user turned the camera off (e.g. via the
+    # agent's disable_camera tool, which cannot reach the session) must not
+    # reach vision.
+    if image_b64 and not await _camera_allowed(sess):
+        image_b64 = None
+        sess.image_b64 = None
     sess._vision_task = None  # type: ignore[attr-defined]
     is_fast_chat = (sess.hint or "").lower() == "chat"
     print("[vision_trace] kickoff decision is_fast_chat={0} image_b64_present={1} hint={2!r}".format(
@@ -3038,6 +3191,15 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
 
     if ftype == "image":
         b64 = frame.get("data") or ""
+        # Consent is re-read per frame rather than cached on the session:
+        # the agent's camera tools and the voice fast-path both write it,
+        # and a stale cache would let one frame through after "stop
+        # watching me". One indexed SQLite read per reply is cheap.
+        if b64 and not await _camera_allowed(sess):
+            sess.image_b64 = None
+            print("[vision_trace] image dropped (camera off) user={0}".format(
+                sess.username), flush=True)
+            return True
         if b64:
             sess.image_b64 = b64
             print("[vision_trace] image stashed user={0} bytes_b64={1}".format(
@@ -3353,7 +3515,11 @@ async def _maybe_push_brain_sync(ws: WebSocket, sess: _Session,
 # Default copy if the config knob isn't published yet (the `vision-debug`
 # slug owns config.py for Phase 6 — fall back so we don't crash if our
 # branch lands first).
-_CAMERA_ANNOUNCE_FALLBACK = (
+_CAMERA_ANNOUNCE_FALLBACK = "Heads up, my camera is on for this conversation."
+# The wording used until 2026-09-30. No longer spoken, but kept in the
+# system-line echo guard so an operator override or an old robot build
+# that still says it cannot switch the camera off by being overheard.
+_CAMERA_ANNOUNCE_LEGACY = (
     "Heads up — my camera is on for this conversation. "
     "Say 'stop watching me' anytime."
 )
@@ -3541,6 +3707,13 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         # stream when the engagement gates fire). Gated on the operator
         # knob so a deployment can opt out without code changes.
         await _maybe_announce_camera_consent(ws, sess)
+        # Tell the robot the persisted camera choice so a user who said
+        # "stop watching me" last time is not photographed this time.
+        try:
+            await _send_json(ws, _control_frame(
+                "camera_state", on=await _camera_allowed(sess)))
+        except Exception:  # noqa: BLE001 -- never break session_open
+            pass
         return True
 
     if sub == "session_close":
@@ -3590,6 +3763,10 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         logger.info(
             "mic_resumed", user=sess.username, session_id=sess.session_id,
         )
+        return True
+
+    if sub == "speaker_identified":
+        await _apply_speaker_identified(sess, data)
         return True
 
     if sub == "user_identified":
