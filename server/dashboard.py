@@ -424,22 +424,32 @@ def snapshot() -> dict[str, Any]:
 _COOKIE = "nao_dash"
 
 
-def _password() -> str:
-    return (os.environ.get("DASHBOARD_PASSWORD")
-            or os.environ.get("NAO_SHARED_SECRET") or "").strip()
+def _credentials() -> tuple[str, str]:
+    """Dashboard login: DASHBOARD_USER + DASHBOARD_PASSWORD, both required.
+
+    Deliberately no fallback to NAO_SHARED_SECRET: only people given the
+    dashboard login can open it.
+    """
+    return ((os.environ.get("DASHBOARD_USER") or "").strip(),
+            (os.environ.get("DASHBOARD_PASSWORD") or "").strip())
 
 
-def _token(pw: str) -> str:
-    return hmac.new(pw.encode(), b"nao-dashboard-v1",
+def _configured() -> bool:
+    user, pw = _credentials()
+    return bool(user and pw)
+
+
+def _token(user: str, pw: str) -> str:
+    return hmac.new(pw.encode(), ("nao-dashboard-v2:" + user).encode(),
                     hashlib.sha256).hexdigest()
 
 
 def _authed(request: Request) -> bool:
-    pw = _password()
-    if not pw:
+    if not _configured():
         return False
+    user, pw = _credentials()
     got = request.cookies.get(_COOKIE, "")
-    return hmac.compare_digest(got, _token(pw))
+    return hmac.compare_digest(got, _token(user, pw))
 
 
 # ─────────────────────────────── routes ───────────────────────────────────
@@ -458,22 +468,26 @@ async def dashboard_image() -> Response:
 
 @router.post("/dashboard/api/login")
 async def dashboard_login(request: Request) -> Response:
-    pw = _password()
-    if not pw:
+    if not _configured():
         return JSONResponse({"ok": False, "error": "no_password"},
                             status_code=503)
+    user, pw = _credentials()
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
-    given = str((body or {}).get("password") or "")
-    if not hmac.compare_digest(given.encode(), pw.encode()):
+    given_user = str((body or {}).get("username") or "").strip()
+    given_pw = str((body or {}).get("password") or "")
+    ok_user = hmac.compare_digest(given_user.lower().encode(),
+                                  user.lower().encode())
+    ok_pw = hmac.compare_digest(given_pw.encode(), pw.encode())
+    if not (ok_user and ok_pw):
         await asyncio.sleep(0.5)  # blunt guessing
-        return JSONResponse({"ok": False, "error": "wrong_password"},
+        return JSONResponse({"ok": False, "error": "wrong_login"},
                             status_code=401)
     resp = JSONResponse({"ok": True})
-    resp.set_cookie(_COOKIE, _token(pw), httponly=True, samesite="strict",
-                    max_age=60 * 60 * 24 * 30)
+    resp.set_cookie(_COOKIE, _token(user, pw), httponly=True,
+                    samesite="strict", max_age=60 * 60 * 24 * 30)
     return resp
 
 
@@ -486,7 +500,7 @@ async def dashboard_logout() -> Response:
 
 @router.get("/dashboard/api/state")
 async def dashboard_state(request: Request) -> Response:
-    if not _password():
+    if not _configured():
         return JSONResponse({"error": "no_password"}, status_code=503)
     if not _authed(request):
         return JSONResponse({"error": "login"}, status_code=401)

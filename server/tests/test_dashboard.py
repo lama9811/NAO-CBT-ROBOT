@@ -15,6 +15,7 @@ from server import dashboard as d
 @pytest.fixture(autouse=True)
 def fresh(monkeypatch):
     monkeypatch.setattr(d, "STATE", d._State())
+    monkeypatch.setenv("DASHBOARD_USER", "admin-test")
     monkeypatch.setenv("DASHBOARD_PASSWORD", "pw-test")
     yield
 
@@ -25,17 +26,32 @@ def _client():
     return TestClient(app)
 
 
-def test_state_needs_the_password():
+def test_state_needs_username_and_password():
     c = _client()
     assert c.get("/dashboard/api/state").status_code == 401
-    assert c.post("/dashboard/api/login", json={"password": "nope"}).status_code == 401
-    assert c.post("/dashboard/api/login", json={"password": "pw-test"}).status_code == 200
+    bad = [{"password": "pw-test"}, {"username": "admin-test", "password": "nope"},
+           {"username": "someone", "password": "pw-test"}]
+    for body in bad:
+        assert c.post("/dashboard/api/login", json=body).status_code == 401
+    ok = c.post("/dashboard/api/login",
+                json={"username": "Admin-Test", "password": "pw-test"})
+    assert ok.status_code == 200
     assert c.get("/dashboard/api/state").status_code == 200
 
 
-def test_no_password_configured_serves_nothing(monkeypatch):
+def test_shared_secret_is_not_a_way_in(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_USER", raising=False)
     monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
-    monkeypatch.delenv("NAO_SHARED_SECRET", raising=False)
+    monkeypatch.setenv("NAO_SHARED_SECRET", "robot-secret")
+    c = _client()
+    r = c.post("/dashboard/api/login",
+               json={"username": "x", "password": "robot-secret"})
+    assert r.status_code == 503
+
+
+def test_no_password_configured_serves_nothing(monkeypatch):
+    monkeypatch.delenv("DASHBOARD_USER", raising=False)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
     c = _client()
     assert c.get("/dashboard/api/state").status_code == 503
     assert c.post("/dashboard/api/login", json={"password": ""}).status_code == 503

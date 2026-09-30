@@ -199,11 +199,13 @@
 
 <section class="gate" id="gate" hidden>
   <h1>NAO status</h1>
-  <p id="gateText">Enter the dashboard password to see how NAO and the Pi are doing.</p>
+  <p id="gateText">Sign in to see how NAO and the Pi are doing.</p>
   <form id="loginForm">
+    <label for="user">Username</label>
+    <input id="user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
     <label for="pw">Password</label>
     <input id="pw" type="password" autocomplete="current-password" required>
-    <button type="submit">Open dashboard</button>
+    <button type="submit">Sign in</button>
     <div class="err" id="loginErr" role="alert"></div>
   </form>
 </section>
@@ -492,7 +494,7 @@
     try {
       const res = await fetch("/dashboard/api/state", { credentials: "same-origin", cache: "no-store" });
       if (res.status === 401) return showGate();
-      if (res.status === 503) return showGate("The dashboard has no password yet. Set DASHBOARD_PASSWORD in the Pi's .env and restart nao-server.");
+      if (res.status === 503) return showGate("The dashboard has no login yet. Set DASHBOARD_USER and DASHBOARD_PASSWORD in the Pi's .env and restart nao-server.");
       const s = await res.json();
       $("gate").hidden = true; $("app").hidden = false;
       lastOk = Date.now();
@@ -509,7 +511,7 @@
     const wasHidden = $("gate").hidden;
     $("app").hidden = true; $("gate").hidden = false;
     if (message) { $("gateText").textContent = message; $("loginForm").hidden = true; }
-    if (wasHidden) $("pw").focus();  // only when the gate first appears
+    if (wasHidden) $("user").focus();  // only when the gate first appears
   }
 
   $("loginForm").addEventListener("submit", async (e) => {
@@ -517,10 +519,10 @@
     $("loginErr").textContent = "";
     const res = await fetch("/dashboard/api/login", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: $("pw").value }), credentials: "same-origin",
+      body: JSON.stringify({ username: $("user").value, password: $("pw").value }), credentials: "same-origin",
     }).catch(() => null);
     if (res && res.ok) { $("pw").value = ""; tick(); }
-    else $("loginErr").textContent = res && res.status === 401 ? "That password is not right." : "Could not reach the Pi.";
+    else $("loginErr").textContent = res && res.status === 401 ? "That username or password is not right." : "Could not reach the Pi.";
   });
   $("logout").addEventListener("click", async () => {
     await fetch("/dashboard/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => null);
