@@ -1737,6 +1737,110 @@ def _persist_voice_profile(sess: _Session, profile: str) -> None:
     )
 
 
+CS_DIRECT_ENABLED = os.environ.get("CS_DIRECT", "1") == "1"
+CS_FILLER = os.environ.get("CS_FILLER", "Let me check that.")
+# Say the filler only if CS Navigator has not answered by then; a cached
+# answer comes back in ~0.1 s and needs no filler.
+CS_FILLER_AFTER_S = float(os.environ.get("CS_FILLER_AFTER_S", "0.8"))
+
+
+async def _speak_line(ws: WebSocket, sess: "_Session", text: str,
+                      voice_phase: str, phase_ms: dict[str, float]) -> bool:
+    """Synthesize and send one fixed line, registered with the echo guards."""
+    with _phase(voice_phase, phase_ms):
+        try:
+            mp3 = await asyncio.to_thread(
+                _synth_for, sess.username, text, sess.voice_profile_override)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("speak_line_tts_failed", user=sess.username,
+                           error=repr(exc))
+            return False
+    if not mp3:
+        return False
+    _record_reply_chunk(sess.username, text)
+    sent = await _send_audio_chunk(
+        ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3))
+    if sent:
+        legacy.LAST_REPLY[sess.username] = text
+        _arm_post_tts_cooldown(sess)
+    return sent
+
+
+async def _emit_cs_direct(ws: WebSocket, sess: "_Session", transcript: str,
+                          phase_ms: dict[str, float],
+                          t_user_done: float) -> None:
+    """Answer an obvious CS question straight from CS Navigator.
+
+    Measured 2026-09-30: the router + two Claude Sonnet calls around the
+    CS Navigator lookup added ~4 s. CS Navigator's own answer is already
+    short and direct, so here it is spoken as-is after Markdown cleanup and
+    trimming. A filler ("Let me check that.") covers a slow lookup.
+    """
+    from server import cs_direct
+    from server.tools import cs_navigator as csn
+
+    sess.turn_idx += 1
+    await _send_json(ws, _control_frame(
+        "transcript", transcript=transcript,
+        stt_ms=phase_ms.get("stt", 0)))
+    _reset_reply_chunks(sess.username, "")
+
+    ctx = {"username": sess.username}
+    t_nav = time.perf_counter()
+    nav = asyncio.create_task(csn._cs_navigator_search_impl(ctx, transcript))
+
+    first_audio_at = None
+    try:
+        await asyncio.wait_for(asyncio.shield(nav), CS_FILLER_AFTER_S)
+    except asyncio.TimeoutError:
+        if await _speak_line(ws, sess, CS_FILLER, "cs_filler_synth",
+                             phase_ms):
+            first_audio_at = time.perf_counter()
+    except Exception:  # noqa: BLE001 -- surfaced when awaited below
+        pass
+
+    try:
+        answer = await nav
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cs_direct_lookup_failed", user=sess.username,
+                       error=repr(exc))
+        answer = csn._FALLBACK_REPLY
+    phase_ms["cs_navigator"] = round((time.perf_counter() - t_nav) * 1000, 2)
+
+    spoken = cs_direct.shorten_for_speech(answer) or csn._FALLBACK_REPLY
+    if await _speak_line(ws, sess, spoken, "tts_synth_first_chunk",
+                         phase_ms) and first_audio_at is None:
+        first_audio_at = time.perf_counter()
+    await _send_json(ws, _control_frame("tts_ended"))
+
+    if first_audio_at is not None:
+        phase_ms["e2e_user_to_first_audio"] = round(
+            (first_audio_at - t_user_done) * 1000, 2)
+    phase_ms["e2e_user_to_answer"] = round(
+        (time.perf_counter() - t_user_done) * 1000, 2)
+
+    # Keep the exchange in the conversation history so a follow-up
+    # ("and what about the other section?") has context in the agent path.
+    try:
+        from server import session as _session
+        hist = _session.get_or_create_session(sess.username)
+        await hist.add_items([
+            {"role": "user", "content": transcript},
+            {"role": "assistant", "content": spoken},
+        ])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cs_direct_history_failed", user=sess.username,
+                       error=repr(exc))
+
+    logger.info(
+        "turn_complete",
+        user=sess.username, session_id=sess.session_id,
+        turn_idx=sess.turn_idx, phase_ms=phase_ms, actions=[],
+        active_agent="cs_direct", outcome="ok",
+        reply_preview=spoken[:120],
+    )
+
+
 async def _apply_speaker_identified(sess: "_Session",
                                     data: dict[str, Any]) -> None:
     """Switch the conversation to whoever NAO just turned toward.
@@ -2981,11 +3085,20 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     # sits in the WS queue until the entire reply finishes — defeating
     # the whole point of barge-in. The task is owned by the session;
     # awaited at session_close (or cancelled if the WS drops).
-    task = asyncio.create_task(
-        _emit_agent_turn(
+    # Obvious Morgan CS questions skip the router and both CS-agent model
+    # calls and go straight to CS Navigator (see server/cs_direct.py).
+    from server import cs_direct
+    if (CS_DIRECT_ENABLED
+            and (sess.hint or "").lower() not in ("therapy", "chat")
+            and cs_direct.is_direct_cs_question(transcript)):
+        _cancel_pending_vision(sess)
+        turn_coro = _emit_cs_direct(ws, sess, transcript, phase_ms,
+                                    t_user_done)
+    else:
+        turn_coro = _emit_agent_turn(
             ws, sess, transcript, image_b64, phase_ms, t_user_done,
         )
-    )
+    task = asyncio.create_task(turn_coro)
     sess.active_turn_task = task
 
     def _clear_active_turn(done_task: asyncio.Task) -> None:

@@ -455,6 +455,16 @@ measuring and wrong that there is nothing to fix.
   `POST /chat/guest`, no token needed; the sibling `csnavigator-adk` service is
   403/private and isn't used). Verified live: prerequisites → "COSC 220 requires
   COSC 112 with a C or higher", 342 ms; faculty lookup 5.3 s.
+- **Obvious CS questions skip the AI entirely (`server/cs_direct.py`, since
+  2026-09-30).** A course code ("COSC 220") or a phrase like "who teaches" /
+  "prerequisite" / "credits to graduate", with no emotional words, goes
+  straight to CS Navigator and its answer is spoken after Markdown cleanup,
+  trimmed to 3 sentences. The router + two Claude Sonnet calls it replaces
+  added ~4 s. NAO says "Let me check that." if the lookup takes over 0.8 s.
+  Measured live: filler at ~1.3 s, answer at 4.5-7 s (was 10-15 s). CS
+  Navigator itself is the floor: 3-6.5 s for a new question, 0.1 s cached.
+  `CS_DIRECT=0` restores the agent path; `CS_FILLER` / `CS_FILLER_AFTER_S`
+  tune the filler.
 - **Everything TTS speaks goes through `server/tts_text.py:to_speakable()`.**
   CS Navigator answers in Markdown (`**COSC 220**`, `*   Dr. Ali - Professor`)
   because it was built for a web UI, and agents emit Markdown too. Without
