@@ -3,6 +3,8 @@ from agents import Agent, handoff
 from server import config, memory, memory_rollup as mr, session
 from server.model_factory import resolve_model
 from server.tools.nao_actions import THERAPIST_ACTIONS
+from server.agents._cs_rule import CS_NAVIGATOR_RULE
+from server.tools.cs_navigator import cs_navigator_search
 from server.tools.emotion import (
     observe_face, log_emotion, identify_distortion, suggest_reframe,
     set_camera_consent, recap_session,
@@ -208,7 +210,7 @@ def build_therapist_agent(username: str) -> Agent:
         month_personas = mr.load_month_personas(username, n=1)
         wk = f"\n\nThis week's theme:\n- {week_themes[0]}" if week_themes else ""
         mo = f"\n\nThis month's persona:\n{month_personas[0]}" if month_personas else ""
-        head = _BASE
+        head = _BASE + CS_NAVIGATOR_RULE
         if preamble:
             head = head + "\n" + preamble
         return head + recap_block + wk + mo
@@ -226,6 +228,7 @@ def build_therapist_agent(username: str) -> Agent:
             log_emotion, identify_distortion, suggest_reframe,
             set_camera_consent, recap_session,
             recall_recent_topics, update_user_note,
+            cs_navigator_search,
             *THERAPIST_ACTIONS,
         ],
         handoffs=[

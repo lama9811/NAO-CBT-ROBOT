@@ -15,6 +15,8 @@ from server.tools.skills_tools import (
     set_timer, add_todo, list_todos, complete_todo,
 )
 from server.tools.nao_actions import CHAT_ACTIONS
+from server.agents._cs_rule import CS_NAVIGATOR_RULE
+from server.tools.cs_navigator import cs_navigator_search
 
 SYSTEM = (
     "You are NAO's utility assistant. Handle time, date, weather, timers, "
@@ -31,8 +33,8 @@ _UTILITY_TOOLS = [
 
 skills_agent = Agent(
     name="skills",
-    instructions=with_memory_preamble(SYSTEM),
+    instructions=with_memory_preamble(SYSTEM + CS_NAVIGATOR_RULE),
     model=resolve_model(config.SKILLS_MODEL),
     model_settings=ModelSettings(max_tokens=config.NANO_MAX_TOKENS),
-    tools=_UTILITY_TOOLS + list(CHAT_ACTIONS),
+    tools=_UTILITY_TOOLS + list(CHAT_ACTIONS) + [cs_navigator_search],
 )

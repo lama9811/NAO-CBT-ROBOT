@@ -20,6 +20,8 @@ from server import config
 from server.model_factory import resolve_model
 from server.agents._memory_inject import with_memory_preamble
 from server.tools.nao_actions import CHAT_ACTIONS
+from server.agents._cs_rule import CS_NAVIGATOR_RULE
+from server.tools.cs_navigator import cs_navigator_search
 
 SYSTEM = (
     "You are a friendly NAO humanoid robot chatting with a student. This is the "
@@ -164,12 +166,12 @@ SYSTEM = (
 # `with_memory_preamble(SYSTEM)` and a higher token cap.
 chat_embodied_agent = Agent(
     name="chat_embodied",
-    instructions=SYSTEM,
+    instructions=SYSTEM + CS_NAVIGATOR_RULE,
     # CHAT_EMBODIED_MODEL, not CHAT_MODEL -- this lane carries the action
     # tools, where provider choice costs real latency (see config.py).
     model=resolve_model(config.CHAT_EMBODIED_MODEL),
     model_settings=ModelSettings(max_tokens=config.FAST_CHAT_MAX_TOKENS),
-    tools=CHAT_ACTIONS,
+    tools=list(CHAT_ACTIONS) + [cs_navigator_search],
 )
 
 
@@ -203,15 +205,14 @@ PURE_SYSTEM = (
 
 pure_chat_agent = Agent(
     name="chat",
-    instructions=PURE_SYSTEM,
+    instructions=PURE_SYSTEM + CS_NAVIGATOR_RULE,
     model=resolve_model(config.CHAT_MODEL),
-    # tool_choice="none" turns off tool selection entirely; tools=[]
-    # belt-and-braces it. Either alone would be enough; both is cheap.
-    model_settings=ModelSettings(
-        max_tokens=60,
-        tool_choice="none",
-    ),
-    tools=[],
+    # One tool only: CS Navigator. A Morgan CS question that missed the
+    # router keywords used to land here with no tools and was answered from
+    # the model's own knowledge, i.e. possibly invented. Small talk still
+    # makes a single round trip; the tool is called only for CS questions.
+    model_settings=ModelSettings(max_tokens=60),
+    tools=[cs_navigator_search],
 )
 
 
