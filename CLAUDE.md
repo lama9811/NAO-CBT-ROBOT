@@ -15,7 +15,9 @@ NAO humanoid robot assistant for Morgan State University, built on the **OpenAI 
 
 `OPENAI_API_KEY` is still **mandatory**: `config.py:17` reads it with
 `os.environ[...]`, so a missing key is a `KeyError` at import and the server
-never boots — and the fallback paths, vision, and safety all still need it.
+never boots. As of 2026-09-30 nothing on the live path *uses* it (brain,
+vision and safety run on Claude; the OpenAI backup voice and Whisper
+fallback are off), but it must still be present and should be valid.
 
 **Two indirection layers make provider a config choice, not a code edit:**
 
@@ -129,6 +131,10 @@ Server (Python 3.11+) — everything under server/
 
 ## Development Guidelines
 
+- **One `.env` per machine.** Keep only `.env` (plus the committed,
+  key-free `.env.example` template). Stray `.env.bak.*` copies were deleted on
+  2026-09-30 because they kept dead keys around and cluttered the editor; if
+  you back up before an edit, delete the copy once the change is verified.
 - **NAO-side** (everything in `nao/`): **Python 2.7 compatible**. `from __future__ import print_function`, `str.format()`, no f-strings, no type hints. On the robot, copy `nao/` contents to `/home/nao/nao_assist/` and run `python /home/nao/nao_assist/main.py`.
 - **Server-side** (`server/`): **Python 3.11+**. Modern idioms fine.
 - IPs/ports read from env or `config.py` — never hardcode.
@@ -465,6 +471,20 @@ measuring and wrong that there is nothing to fix.
   Navigator itself is the floor: 3-6.5 s for a new question, 0.1 s cached.
   `CS_DIRECT=0` restores the agent path; `CS_FILLER` / `CS_FILLER_AFTER_S`
   tune the filler.
+- **Every agent answers Morgan CS questions from CS Navigator
+  (`server/agents/_cs_rule.py`, since 2026-09-30).** One shared prompt rule is
+  appended to everyday chat, action chat, utilities and the therapist, and
+  each has the `cs_navigator_search` tool. Before this the everyday chat
+  agent had no tools, so a CS question that missed the router's keywords was
+  answered from the model's memory (i.e. possibly invented). Edit the rule in
+  that one file.
+- **Spoken mute replies.** "be quiet" / "mute" answers "Okay, my lips are
+  closed now." (forced through the mute, like the 988 reply); "unmute" / "you
+  can talk" answers "I'm back." (`MUTE_ACK` / `UNMUTE_ACK` to reword). While
+  muted, `mute_words.classify_while_muted` accepts an unmute phrase anywhere
+  in the utterance at any length, plus STT mishearings like "on mute" — the
+  strict four-word rule had ignored "You know, you can talk now." and left
+  NAO stuck silent.
 - **Everything TTS speaks goes through `server/tts_text.py:to_speakable()`.**
   CS Navigator answers in Markdown (`**COSC 220**`, `*   Dr. Ali - Professor`)
   because it was built for a web UI, and agents emit Markdown too. Without
@@ -569,9 +589,23 @@ are also permission-scoped: a key without `voices_read` **cannot list voices**
 (401), so you cannot discover an ID from the API — the working IDs are recorded
 in `.env`, and losing them means losing the voice.
 
-`OPENAI_AGENTS_TRACE=1` uploads traces to OpenAI on every turn. With a dead or
-absent OpenAI key that is a wasted round-trip per turn; set it to `0` on any
-deploy not using OpenAI.
+**Tracing:** `OPENAI_AGENTS_TRACE` is read into `config.py` and then used by
+nothing, so it does not control anything (removed from the Mac `.env`
+2026-09-30). The Agents SDK uploads traces to OpenAI by default; the switch
+that actually turns that off is `OPENAI_AGENTS_DISABLE_TRACING=1`.
+
+**2026-09-30: the Claude key died and NAO went silent.** From 14:18 every
+reply failed with `AuthenticationError ... API key is invalid` while Deepgram
+and ElevenLabs kept working — NAO heard everyone and said nothing. The Mac
+and Pi held the *same* Anthropic key, so copying it between them could not
+help; adding credit did not help either (an empty balance returns "credit
+balance is too low", not "invalid"). A new key from console.anthropic.com
+fixed it. Test a key with a free call before trusting it:
+`curl -s -o /dev/null -w '%{http_code}' https://api.anthropic.com/v1/models -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01'`.
+Copy a key to the Pi through stdin, never on the command line:
+`grep '^ANTHROPIC_API_KEY=' .env | ssh naoserver 'k=$(cat); sed -i "s|^ANTHROPIC_API_KEY=.*|$k|" ~/nao-sagecbt/.env'`
+then `sudo systemctl restart nao-server`. The live dashboard now checks every
+key every 5 minutes, so this shows in red immediately.
 
 ### Known bugs
 
@@ -723,6 +757,10 @@ conversation, today's numbers, and recent warnings.
   authenticated (`DASHBOARD_INGEST_SECRET`).
 - Support-agent and crisis turns are shown as "Support conversation" with no
   words, by design. Everything is in memory only; a restart clears it.
+- Status of the Vercel copy (2026-09-30): the project is deployed from this
+  repo (Root Directory `vercel-dashboard`) but the Upstash Redis database was
+  not yet connected, and the Pi's `DASHBOARD_REMOTE_URL` is still empty.
+  The app finds the Upstash env vars under any prefix (`findRedisEnv`).
 - Hosted copy on Vercel: `vercel-dashboard/` (import the repo with Root
   Directory = `vercel-dashboard`; see its README). The Pi cannot be reached
   from the cloud, so it POSTs its snapshot to `DASHBOARD_REMOTE_URL/api/ingest`
@@ -755,6 +793,15 @@ the robot's face DB *and* upserts the `users` row (`_emit_motion` →
 `memory.ensure_user`). Both must happen or recognition silently never works.
 
 ## Debugging the robot
+
+- **Beeping every few seconds = low battery, not a bug.** At about 15-20%
+  NAOqi's system notification 801 ("My battery will soon need charging")
+  flaps on and off; each time it plays a chime and tries to speak. Our code
+  mutes NAOqi's own TTS, so only the chime is heard. Charge the robot. Read it
+  in `journalctl` as `setting system notification 801`.
+- **Purple eyes and chest, robot limp = Autonomous Life's sleep mode**
+  (a ~3 s front-head hold while Life is running). `LifeGuard` in
+  `nao/awareness.py` keeps Life disabled, which prevents it.
 
 - **Never diagnose reachability with `ping`.** The gateway and the robot
   ignore/drop ICMP; "100% packet loss" told us the robot was dead three times
