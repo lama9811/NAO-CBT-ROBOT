@@ -450,15 +450,20 @@ class SoundLocalizer(object):
         # Defensive shape check. ALMemory has been known to occasionally
         # return scalars in odd states, and the polling pattern is
         # vulnerable to a partially-written memory entry.
+        # NAOqi 2.8 stores [ts, [az, el, conf, energy], head6D, head6D];
+        # the old [ts, [conf, energy], [az, el]] reading returned az=0 on
+        # this robot. parse_sound_event handles both layouts.
         try:
-            ts_pair = event[0]
-            conf_energy = event[1]
-            geometry = event[2]
-            confidence = float(conf_energy[0])
-            azimuth_rad = float(geometry[0])
-            elevation_rad = float(geometry[1])
-        except (IndexError, TypeError, ValueError):
+            from awareness import parse_sound_event
+            parsed = parse_sound_event(event)
+        except Exception:
+            parsed = None
+        if parsed is None:
             return
+        ts_pair = list(parsed["ts"])
+        confidence = parsed["confidence"]
+        azimuth_rad = parsed["head_yaw"] + parsed["azimuth"]
+        elevation_rad = parsed["elevation"]
 
         # Dedupe: identical timestamp means the localizer hasn't fired
         # since last poll. (Compare element-wise; lists from NAOqi don't

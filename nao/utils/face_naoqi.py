@@ -10,6 +10,21 @@ except NameError:
 
 _TEXT_TYPES = (str, unicode_type)
 
+
+def face_min_score():
+    """Minimum ALFaceDetection recognition score to trust a name.
+
+    NAOqi returns its best guess even when it is weak. On 2026-09-30 it
+    matched Mingma to the learned face "Mason" at 0.646, and NAO called
+    them Mason for the whole conversation. Below this score the face is
+    treated as unknown: NAO uses no name rather than the wrong one.
+    """
+    import os
+    try:
+        return float(os.environ.get("FACE_RECO_MIN_SCORE", "0.75"))
+    except (TypeError, ValueError):
+        return 0.75
+
 # NAO V6 top camera intrinsics (from Aldebaran datasheet).
 # Used by detect_faces_with_geometry to convert face size in the image
 # into an approximate distance.
@@ -67,6 +82,12 @@ def recognize_face_naoqi(qi_session, tts, subscriber_name="FaceReco", timeout=10
                             extra_info = first_face[1]
                             if isinstance(extra_info, list) and len(extra_info) >= 3:
                                 face_name = extra_info[2]
+                                try:
+                                    score = float(extra_info[1])
+                                except (TypeError, ValueError):
+                                    score = 0.0
+                                if score < face_min_score():
+                                    face_name = ""  # weak match
                                 if face_name and isinstance(face_name, _TEXT_TYPES) and face_name.strip() != "":
                                     recognized_name = face_name.strip()
                                     print("[Recognized]: {}".format(recognized_name))
@@ -258,6 +279,8 @@ def _parse_face_record(face_info):
         except (TypeError, ValueError):
             confidence = 0.0
         name = _coerce_text(extra[2])
+        if name and confidence < face_min_score():
+            name = ""  # weak match: unknown, not a guess
 
     return {
         "face_id": face_id,

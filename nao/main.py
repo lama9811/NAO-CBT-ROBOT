@@ -247,6 +247,20 @@ def _disable_autonomous(ip, port):
             pass
 
 
+def _start_life_guard(log):
+    """Build the Autonomous Life guard and hold Life disabled at boot."""
+    if not _HAS_NAOQI:
+        return None
+    try:
+        from awareness import build_life_guard
+        guard = build_life_guard(config.NAO_IP, config.NAO_PORT, log=log)
+        guard.start_boot_thread()
+        return guard
+    except Exception as exc:
+        log.warn("life_guard_start_failed", error=str(exc))
+        return None
+
+
 def _stop_audio_proxies(ip, port):
     """Crash-recovery teardown - make sure the recorder + player are quiet
     before the next reconnect attempt. Same shape as the old conversation
@@ -533,8 +547,11 @@ class _SessionController(object):
             edge-case face flicker.
     """
 
-    def __init__(self, log, audio, tts, vad, brain):
+    def __init__(self, log, audio, tts, vad, brain, life_guard=None):
         self._log = log
+        self._life_guard = life_guard
+        if life_guard is not None:
+            life_guard.on_redisabled = self._on_life_redisabled
         self._audio = audio
         self._tts = tts
         self._vad = vad
@@ -547,6 +564,59 @@ class _SessionController(object):
         # head onto the closest visible face the rest of the time.
         self._sound_localizer = None
         self._face_tracker = None
+        self._head_awareness = None
+
+    def _start_idle_posture_watch(self):
+        """Sit NAO down after ``IDLE_SIT_S`` of silence; stand on new talk.
+
+        "Activity" is a real transcript or NAO replying (ws_client's
+        ``last_activity_ts``). IDLE_SIT_S=0 disables sitting.
+        """
+        try:
+            idle_s = float(os.environ.get("IDLE_SIT_S", "90"))
+        except ValueError:
+            idle_s = 90.0
+        if idle_s <= 0 or not _HAS_NAOQI:
+            return
+        stop = threading.Event()
+        self._idle_watch_stop = stop
+
+        def _watch():
+            sat = False
+            while not stop.wait(3.0):
+                client = self._client
+                if client is None:
+                    return
+                last = getattr(client, "last_activity_ts", None) or 0.0
+                quiet = time.time() - last
+                if not sat and quiet >= idle_s:
+                    sat = True
+                    self._log.info("idle_sit", quiet_s=int(quiet))
+                    try:
+                        ALProxy("ALRobotPosture", config.NAO_IP,
+                                config.NAO_PORT).goToPosture("Sit", 0.5)
+                    except Exception as exc:
+                        self._log.debug("idle_sit_failed", error=str(exc))
+                elif sat and quiet < idle_s:
+                    sat = False
+                    self._log.info("idle_stand_on_activity")
+                    self.kick_stand_up(reason="activity_after_idle")
+
+        t = threading.Thread(target=_watch, name="nao-idle-posture")
+        t.daemon = True
+        t.start()
+
+    def _stop_idle_posture_watch(self):
+        stop = getattr(self, "_idle_watch_stop", None)
+        if stop is not None:
+            stop.set()
+        self._idle_watch_stop = None
+
+    def _on_life_redisabled(self, was_state, context):
+        # Entering Life's "disabled" state calls ALMotion.rest(); if a
+        # session is live the robot has just slumped, so stand it back up.
+        if self._client is not None:
+            self.kick_stand_up(reason="life_redisabled")
 
     def engage(self, face_id, gate, confidence, distance_m,
                returning_user_hint=None):
@@ -662,6 +732,7 @@ class _SessionController(object):
             #     conversation feel like NAO is *looking at you* rather
             #     than staring straight ahead.
             self._start_head_behaviors()
+            self._start_idle_posture_watch()
 
             # 6. Onboarding face-recognition scan. Runs ~3 s after engage
             # on a daemon thread so the camera_announce + first turn
@@ -736,7 +807,12 @@ class _SessionController(object):
         visible reaction to touch. Set ENGAGE_POSTURE=Stand to restore the
         original behavior, or ENGAGE_POSTURE=none to not move at all.
         """
-        posture_name = os.environ.get("ENGAGE_POSTURE", "Sit").strip()
+        # Stand while talking (changed from Sit on 2026-09-30: every head
+        # touch ran this with the Sit default and sat NAO down mid-chat,
+        # because the robot's launcher never sets ENGAGE_POSTURE). The
+        # idle watcher below sits it down once nobody has spoken for a
+        # while, which is where the battery saving comes from now.
+        posture_name = os.environ.get("ENGAGE_POSTURE", "Stand").strip()
         if posture_name.lower() == "none":
             self._log.debug("engage_posture_disabled", reason=reason)
             return
@@ -873,6 +949,16 @@ class _SessionController(object):
         if not _HAS_NAOQI:
             return
 
+        # HEAD_AWARENESS=1 (default): nao/awareness.py turns the head toward
+        # whoever speaks (ALSoundLocalization, NAOqi 2.8 layout), holds it
+        # there, and lets ALTracker lock onto their face. Sounds are ignored
+        # while NAO itself talks. HEAD_AWARENESS=0 restores the old
+        # SoundLocalizer + ALTracker pair below.
+        if os.environ.get("HEAD_AWARENESS", "1").strip() != "0":
+            if self._start_head_awareness():
+                return
+            self._log.warn("head_awareness_unavailable_falling_back")
+
         # Sound localizer — turns the head toward whoever just spoke.
         # SOUND_LOCALIZER=0 keeps the head still instead of swinging it
         # toward every noise in the room.
@@ -926,7 +1012,94 @@ class _SessionController(object):
             self._log.warn("face_tracker_start_failed", error=str(exc))
             self._face_tracker = None
 
+    def _start_head_awareness(self):
+        try:
+            from awareness import build_head_awareness
+            client = self._client
+            ha = build_head_awareness(
+                config.NAO_IP, config.NAO_PORT,
+                is_speaking=getattr(client, "_is_speaking_now", None),
+                life_guard=self._life_guard,
+                log=self._log,
+                on_turn=self._on_voice_turn,
+            )
+            if ha is None or not ha.start():
+                return False
+            self._head_awareness = ha
+            return True
+        except Exception as exc:
+            self._log.warn("head_awareness_start_failed", error=str(exc))
+            self._head_awareness = None
+            return False
+
+    def _scan_face(self, subscriber_name, timeout):
+        """Run one silent face-recognition scan. Returns (name, visible).
+
+        ``name`` is None for an unknown or weakly matched face (see
+        ``face_naoqi.face_min_score``).
+        """
+        name, visible = None, False
+        try:
+            import qi as _qi
+            qi_session = _qi.Session()
+            qi_session.connect("tcp://" + str(config.NAO_IP) + ":"
+                               + str(config.NAO_PORT))
+            from utils.face_naoqi import recognize_face_naoqi
+            res = recognize_face_naoqi(qi_session, None,
+                                       subscriber_name=subscriber_name,
+                                       timeout=timeout, return_seen=True)
+            if isinstance(res, tuple):
+                name, visible = res
+            else:
+                name = res
+        except Exception as exc:
+            self._log.debug("face_scan_failed", error=str(exc))
+        if name and str(name).strip().lower() in ("guest", "unknown"):
+            name = None
+        return (name or None), bool(visible)
+
+    def _on_voice_turn(self, yaw):
+        """After NAO turns toward a new voice, find out who is there.
+
+        Debounced: a newer turn supersedes a pending scan, so a burst of
+        turns produces one identification for wherever the head settled.
+        The server switches the conversation to that person, or to an
+        anonymous guest if the face is unknown, so NAO stops calling a new
+        speaker by the previous person's name.
+        """
+        self._speaker_scan_gen = getattr(self, "_speaker_scan_gen", 0) + 1
+        gen = self._speaker_scan_gen
+
+        def _run():
+            time.sleep(1.2)  # let ALTracker settle on the face
+            if gen != self._speaker_scan_gen or self._client is None:
+                return
+            name, visible = self._scan_face("SpeakerScan", 2.0)
+            if gen != self._speaker_scan_gen or self._client is None:
+                return
+            payload = {"name": name, "recognized": bool(name),
+                       "face_visible": visible, "source": "voice_turn"}
+            self._log.info("speaker_identified", name=name,
+                           face_visible=visible)
+            try:
+                self._client.push_control("speaker_identified", payload)
+            except Exception as exc:
+                self._log.debug("speaker_identified_push_failed",
+                                error=str(exc))
+
+        t = threading.Thread(target=_run, name="nao-speaker-scan")
+        t.daemon = True
+        t.start()
+
     def _stop_head_behaviors(self):
+        ha = self._head_awareness
+        self._head_awareness = None
+        if ha is not None:
+            try:
+                ha.stop()
+            except Exception:
+                pass
+
         sl = self._sound_localizer
         self._sound_localizer = None
         if sl is not None:
@@ -966,6 +1139,7 @@ class _SessionController(object):
         except Exception:
             pass
 
+        self._stop_idle_posture_watch()
         # Stop head-tracking before tearing down the WS so the head
         # doesn't keep tracking after we're done.
         try:
@@ -1025,6 +1199,11 @@ def main():
              phase="phase_3_main_rewire")
 
     _disable_autonomous(config.NAO_IP, config.NAO_PORT)
+    # The one-shot disable above does not stick: Life finishes its own boot
+    # a few seconds later and re-enables itself (see awareness.py). Hold it
+    # down until it stays down, and let sessions re-stand the robot if Life
+    # has to be knocked down again (entering "disabled" rests the motors).
+    life_guard = _start_life_guard(log)
     _set_volume(config.NAO_IP, config.NAO_PORT, level=100)
 
     # ALBroker MUST exist before any ALModule subclass is constructed
@@ -1081,7 +1260,8 @@ def main():
 
             fallback = _build_wake_listener(log)
 
-            session = _SessionController(log, audio, tts, vad, brain)
+            session = _SessionController(log, audio, tts, vad, brain,
+                                         life_guard=life_guard)
 
             # ------------------------------------------------------------------
             # Wake-state callbacks. These run on the WSM thread; they delegate

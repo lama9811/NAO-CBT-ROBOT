@@ -170,7 +170,7 @@ do_deploy() {
     log "deploying nao/ to nao@$NAO_IP:/home/nao/nao_assist/"
     nao_rsync -az --delete \
         --exclude='*.pyc' --exclude='__pycache__' --exclude='nao.log' \
-        --exclude='.last_user.json' \
+        --exclude='.last_user.json' --exclude='logs/' \
         -e "ssh $SSH_OPTS" \
         "$PROJECT_ROOT/nao/" "nao@$NAO_IP:/home/nao/nao_assist/"
     # Wipe any stale .pyc on the robot — Python 2 prefers cached bytecode

@@ -258,6 +258,15 @@ class NaoWsClient(object):
         # already-queued audio locally instead of waiting for the server to
         # stop sending it.
         self._muted = False
+        # Camera consent, mirrored from the server's `camera_state` frames
+        # and the voice camera actions. While False, no photo is taken or
+        # sent. Starts True (Phase 6 default-on); the server sends the
+        # persisted choice right after session_open.
+        self._camera_on = True
+        # Last time anyone spoke (a real transcript) or NAO replied. main.py
+        # reads it to sit NAO down after a quiet spell and stand it back up
+        # when talk resumes.
+        self.last_activity_ts = time.time()
         # Keep the mic live while NAO speaks so "mute" can be heard at all.
         self._mute_listen_during_tts = (
             os.environ.get("MUTE_LISTEN_DURING_TTS", "1") == "1"
@@ -342,6 +351,10 @@ class NaoWsClient(object):
         doesn't block the receiver thread or delay the next audio chunk.
         Best-effort — failures are debug-logged and non-fatal.
         """
+        if not self._camera_on:
+            self.log.debug("snap_skipped_camera_off", reason=reason)
+            return
+
         def _do_snap():
             try:
                 from utils import camera_capture
@@ -528,6 +541,7 @@ class NaoWsClient(object):
         # is a no-op if the thread is already running).
         if not self._tts_active.is_set():
             self._tts_active.set()
+        self.last_activity_ts = time.time()
         # Same reason, and the one that bites hardest: without tts_started
         # the mic gate never closed, so NAO recorded its own speech and
         # transcribed itself into an ask/echo/ask loop. Audio arriving is
@@ -566,6 +580,12 @@ class NaoWsClient(object):
             return
         name = frame.get("name")
         args = frame.get("args") or {}
+        # Camera on/off are state changes, not body motions: nao_execute
+        # has no handler for them, so they used to log "unknown action"
+        # and the camera kept running after NAO said "Camera off."
+        if name in ("disable_camera", "enable_camera"):
+            self._set_camera_on(name == "enable_camera", source="action")
+            return
         try:
             self._suppress_speaking_gestures_for_action(name,
                                                         phase="enqueue")
@@ -751,6 +771,9 @@ class NaoWsClient(object):
             self._on_tts_started(data)
         elif sub == "tts_ended":
             self._on_tts_ended(data)
+        elif sub == "camera_state":
+            self._set_camera_on(bool(data.get("on", True)),
+                                source="server")
         elif sub == "mute":
             self._on_mute(data)
         elif sub == "unmute":
@@ -765,6 +788,8 @@ class NaoWsClient(object):
             # consume this for LED/UI cues.
             reject_reason = (data.get("reject_reason") or "").strip()
             tx = (data.get("transcript") or "").strip()
+            if tx and not reject_reason and not data.get("wait"):
+                self.last_activity_ts = time.time()
             self.log.info("transcript",
                           transcript=data.get("transcript", ""),
                           stt_ms=data.get("stt_ms"),
@@ -949,6 +974,12 @@ class NaoWsClient(object):
         except Exception:
             pass
         self.log.info("muted")
+
+    def _set_camera_on(self, on, source="server"):
+        on = bool(on)
+        changed = on != self._camera_on
+        self._camera_on = on
+        self.log.info("camera_state", on=on, source=source, changed=changed)
 
     def _is_speaking_now(self):
         """True while NAO's own speaker is live.
