@@ -49,3 +49,6 @@ sim/reports/chat_model_bench/
 sim/reports/fast_chat_bench/
 sim/reports/stt_ab/
 sim/reports/vision_battery/
+
+# Browser screenshots from local dashboard previews
+.playwright-mcp/

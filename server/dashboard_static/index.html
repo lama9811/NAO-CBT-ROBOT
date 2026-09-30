@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NAO status</title>
+<style>
+  :root {
+    --paper: #F4F6F9;      /* cool studio white, not cream */
+    --shell: #FFFFFF;      /* NAO's glossy shell */
+    --graphite: #2A2D33;   /* NAO's dark panels */
+    --steel: #737A85;      /* joints and secondary text */
+    --hairline: #DCE1E8;
+    --eye: #2F74E0;        /* NAO's eye LED, the one accent */
+    --good: #1E8E4E;
+    --warn: #B7791F;
+    --bad: #C8373D;
+    --serif: "Times New Roman", Times, "Liberation Serif", serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--paper); color: var(--graphite); }
+  body {
+    font-family: var(--serif);
+    font-size: 18px;
+    line-height: 1.45;
+    font-variant-numeric: lining-nums tabular-nums;
+    padding: 0 clamp(16px, 4vw, 56px) 64px;
+  }
+  a { color: var(--eye); }
+  :focus-visible { outline: 3px solid var(--eye); outline-offset: 3px; border-radius: 4px; }
+
+  /* ── Masthead: the state of the robot, said in a sentence ── */
+  header.mast {
+    max-width: 1320px; margin: 0 auto;
+    padding: 40px 0 24px;
+    display: grid; grid-template-columns: 1fr auto; gap: 16px 32px; align-items: end;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .verdict {
+    margin: 0;
+    font-size: clamp(34px, 5.2vw, 64px);
+    line-height: 1.02;
+    font-weight: 400;
+    letter-spacing: -0.015em;
+    max-width: 18ch;
+  }
+  .verdict .lamp {
+    display: inline-block; width: 0.42em; height: 0.42em; border-radius: 50%;
+    margin-right: 0.28em; vertical-align: 0.12em;
+    background: var(--steel);
+    box-shadow: 0 0 0 0.12em color-mix(in srgb, currentColor 0%, transparent);
+  }
+  .verdict[data-tone="good"] .lamp { background: var(--good); box-shadow: 0 0 0 0.14em color-mix(in srgb, var(--good) 18%, transparent); }
+  .verdict[data-tone="warn"] .lamp { background: var(--warn); box-shadow: 0 0 0 0.14em color-mix(in srgb, var(--warn) 18%, transparent); }
+  .verdict[data-tone="bad"]  .lamp { background: var(--bad);  box-shadow: 0 0 0 0.14em color-mix(in srgb, var(--bad) 18%, transparent); }
+  .mast-meta { text-align: right; color: var(--steel); font-size: 16px; }
+  .mast-meta strong { color: var(--graphite); font-weight: 400; }
+  .mast-meta button {
+    margin-top: 8px; font: inherit; font-size: 15px; color: var(--steel);
+    background: none; border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 4px 14px; cursor: pointer;
+  }
+  .mast-meta button:hover { color: var(--graphite); border-color: var(--steel); }
+  .explain { grid-column: 1 / -1; margin: 0; max-width: 70ch; color: var(--steel); font-size: 19px; font-style: italic; }
+
+  /* ── Main grid ── */
+  main {
+    max-width: 1320px; margin: 32px auto 0;
+    display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 40px;
+  }
+  h2 { font-size: 26px; font-weight: 400; margin: 0 0 4px; letter-spacing: -0.005em; }
+  .sub { margin: 0 0 18px; color: var(--steel); font-size: 16px; }
+
+  /* ── The robot: status drawn onto its body ── */
+  .anatomy {
+    position: relative;
+    background: var(--shell);
+    border-radius: 36px 36px 36px 36px / 30px 30px 30px 30px;
+    padding: 12px 0 0;
+    box-shadow: 0 1px 0 var(--hairline), 0 24px 60px -36px rgba(42, 45, 51, 0.35);
+  }
+  .stage { position: relative; aspect-ratio: 4 / 3; }
+  .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .stage svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .stage svg line { stroke: var(--hairline); stroke-width: 2; }
+  .stage svg circle { stroke: var(--shell); stroke-width: 3; }
+  .tag {
+    position: absolute; transform: translateY(-50%);
+    width: 25%; min-width: 150px;
+    font-size: 16px; line-height: 1.25;
+  }
+  .tag.left { text-align: right; }
+  .tag .name { display: block; font-size: 19px; }
+  .tag .state { display: block; color: var(--steel); font-size: 15px; }
+  .tag .dot, .row .dot, .svc .dot {
+    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--steel); vertical-align: 2px; margin: 0 6px;
+  }
+  [data-tone="good"] > .dot, .dot[data-tone="good"] { background: var(--good); }
+  [data-tone="warn"] > .dot, .dot[data-tone="warn"] { background: var(--warn); }
+  [data-tone="bad"]  > .dot, .dot[data-tone="bad"]  { background: var(--bad); }
+  .tag[data-tone="good"] .dot { background: var(--good); }
+  .tag[data-tone="warn"] .dot { background: var(--warn); }
+  .tag[data-tone="bad"] .dot { background: var(--bad); }
+  .tag[data-tone="bad"] .state { color: var(--bad); }
+  .tag[data-tone="warn"] .state { color: var(--warn); }
+
+  .battery {
+    display: flex; align-items: center; gap: 14px;
+    padding: 18px 28px 22px; border-top: 1px solid var(--hairline);
+  }
+  .cell {
+    flex: 1; height: 14px; border-radius: 999px; background: var(--paper);
+    border: 1px solid var(--hairline); overflow: hidden;
+  }
+  .cell i { display: block; height: 100%; width: 0%; background: var(--good); border-radius: 999px; transition: width 0.6s ease; }
+  .cell[data-tone="warn"] i { background: var(--warn); }
+  .cell[data-tone="bad"] i { background: var(--bad); }
+  .battery .pct { font-size: 28px; min-width: 3.2ch; text-align: right; }
+  .battery .note { color: var(--steel); font-size: 15px; min-width: 16ch; }
+
+  /* Mobile: the tags leave the drawing and become a list. */
+  .taglist { display: none; list-style: none; margin: 0; padding: 8px 20px 12px; }
+  .taglist li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--hairline); }
+  .taglist li:first-child { border-top: 0; }
+  .taglist .state { color: var(--steel); }
+
+  /* ── Conversation feed ── */
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 780px; overflow: auto; }
+  .turn { display: grid; grid-template-columns: 7.5ch 1fr; gap: 4px 14px; padding: 14px 0; border-top: 1px solid var(--hairline); }
+  .turn:first-child { border-top: 0; }
+  .turn time { color: var(--steel); font-size: 15px; padding-top: 3px; white-space: nowrap; }
+  .turn .q { margin: 0; font-size: 19px; }
+  .turn .a { margin: 4px 0 0; color: var(--graphite); opacity: 0.78; }
+  .turn .by { margin: 4px 0 0; color: var(--steel); font-size: 15px; }
+  .turn.quiet .q { color: var(--steel); font-style: italic; font-size: 17px; }
+  .turn.private .q { font-style: italic; }
+  .turn.new { animation: arrive 1.2s ease-out; }
+  @keyframes arrive { from { background: color-mix(in srgb, var(--eye) 9%, transparent); } to { background: transparent; } }
+  .empty { color: var(--steel); font-style: italic; padding: 12px 0; }
+
+  /* ── Lower band ── */
+  .lower {
+    max-width: 1320px; margin: 48px auto 0;
+    display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 40px;
+    border-top: 1px solid var(--hairline); padding-top: 28px;
+  }
+  .figures { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px; }
+  .fig b { display: block; font-size: 40px; font-weight: 400; line-height: 1; }
+  .fig span { color: var(--steel); font-size: 15px; }
+  .services { list-style: none; margin: 24px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 24px; }
+  .svc { padding: 8px 0; border-top: 1px solid var(--hairline); }
+  .svc .dot { margin-left: 0; }
+  .svc small { color: var(--steel); font-size: 15px; display: block; padding-left: 15px; }
+  .problems { list-style: none; margin: 0; padding: 0; }
+  .problems li { padding: 10px 0; border-top: 1px solid var(--hairline); }
+  .problems li:first-child { border-top: 0; }
+  .problems time { color: var(--steel); font-size: 15px; margin-right: 10px; }
+  .problems .lvl-error { color: var(--bad); }
+
+  /* ── Login and offline states ── */
+  .gate { max-width: 440px; margin: 12vh auto 0; }
+  .gate h1 { font-size: 44px; font-weight: 400; margin: 0 0 8px; }
+  .gate p { color: var(--steel); }
+  .gate label { display: block; margin: 24px 0 8px; }
+  .gate input {
+    width: 100%; font: inherit; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid var(--hairline); background: var(--shell); color: var(--graphite);
+  }
+  .gate button {
+    margin-top: 16px; font: inherit; padding: 10px 22px; border-radius: 999px;
+    border: 0; background: var(--graphite); color: var(--shell); cursor: pointer;
+  }
+  .gate .err { color: var(--bad); min-height: 1.4em; margin-top: 12px; }
+  .banner {
+    max-width: 1320px; margin: 16px auto 0; padding: 12px 18px; border-radius: 14px;
+    background: color-mix(in srgb, var(--bad) 8%, var(--shell)); color: var(--bad);
+  }
+  [hidden] { display: none !important; }
+
+  @media (max-width: 980px) {
+    main, .lower { grid-template-columns: 1fr; }
+    .figures { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) {
+    header.mast { grid-template-columns: 1fr; }
+    .mast-meta { text-align: left; }
+    .tag, .stage svg { display: none; }
+    .taglist { display: block; }
+    .figures { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .turn.new { animation: none; }
+    .cell i { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<section class="gate" id="gate" hidden>
+  <h1>NAO status</h1>
+  <p id="gateText">Enter the dashboard password to see how NAO and the Pi are doing.</p>
+  <form id="loginForm">
+    <label for="pw">Password</label>
+    <input id="pw" type="password" autocomplete="current-password" required>
+    <button type="submit">Open dashboard</button>
+    <div class="err" id="loginErr" role="alert"></div>
+  </form>
+</section>
+
+<div id="app" hidden>
+  <div class="banner" id="offline" role="alert" hidden>
+    The Pi is not answering. It may be off, restarting, or off the network. This page keeps trying.
+  </div>
+
+  <header class="mast">
+    <h1 class="verdict" id="verdict" data-tone=""><span class="lamp"></span><span id="verdictText">Checking on NAO</span></h1>
+    <div class="mast-meta">
+      <div>Updated <strong id="updated">just now</strong></div>
+      <div>Pi code <strong id="version">unknown</strong>, up <strong id="uptime">unknown</strong></div>
+      <button type="button" id="logout">Sign out</button>
+    </div>
+    <p class="explain" id="explain"></p>
+  </header>
+
+  <main>
+    <section aria-labelledby="bodyTitle">
+      <h2 id="bodyTitle">The robot</h2>
+      <p class="sub">Each part of NAO shows the service it depends on.</p>
+      <div class="anatomy">
+        <div class="stage" id="stage">
+          <img src="/dashboard/nao.jpg" alt="NAO robot, standing">
+          <svg viewBox="0 0 1200 900" id="wires" aria-hidden="true"></svg>
+        </div>
+        <ul class="taglist" id="taglist"></ul>
+        <div class="battery" id="batteryRow">
+          <span class="pct" id="batPct">?</span>
+          <div class="cell" id="batCell" role="img" aria-label="Battery level"><i id="batFill"></i></div>
+          <span class="note" id="batNote">Waiting for the robot</span>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="feedTitle">
+      <h2 id="feedTitle">Conversation</h2>
+      <p class="sub">Newest first. Support conversations are never shown word for word.</p>
+      <ol class="feed" id="feed"><li class="empty">Nothing asked yet since the Pi started.</li></ol>
+    </section>
+  </main>
+
+  <section class="lower">
+    <div>
+      <h2>Today</h2>
+      <div class="figures" id="figures"></div>
+      <ul class="services" id="services"></ul>
+    </div>
+    <div>
+      <h2>Recent problems</h2>
+      <p class="sub">Warnings and errors the Pi logged, newest first.</p>
+      <ul class="problems" id="problems"><li class="empty">No problems logged since the Pi started.</li></ul>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  // Where each status touches the robot, in the photo's own pixels
+  // (1200 x 900), and which side its label sits on.
+  const TAGS = [
+    { key: "deepgram",     name: "Hearing",        what: "Deepgram",           at: [560, 80],  side: "right", y: 7 },
+    { key: "elevenlabs",   name: "Voice",          what: "ElevenLabs",         at: [594, 132], side: "right", y: 19 },
+    { key: "claude",       name: "Brain",          what: "Claude",             at: [640, 262], side: "right", y: 33 },
+    { key: "cs_navigator", name: "Morgan CS",      what: "CS Navigator",       at: [660, 330], side: "right", y: 47 },
+    { key: "openai",       name: "Backup voice",   what: "OpenAI",             at: [724, 470], side: "right", y: 62 },
+    { key: "robot",        name: "Robot program",  what: "NAO",                at: [470, 100], side: "left",  y: 11 },
+    { key: "life",         name: "Built-in autopilot", what: "Autonomous Life", at: [470, 300], side: "left",  y: 32 },
+    { key: "link",         name: "Link to the Pi", what: "WebSocket",          at: [455, 560], side: "left",  y: 58 },
+    { key: "pi",           name: "Pi server",      what: "naoserver",          at: [470, 872], side: "left",  y: 88 },
+  ];
+
+  const stage = $("stage");
+  const wires = $("wires");
+  const tagEls = {};
+  for (const t of TAGS) {
+    const el = document.createElement("div");
+    el.className = "tag " + t.side;
+    el.style.top = t.y + "%";
+    el.style[t.side === "left" ? "left" : "right"] = "1.5%";
+    el.innerHTML = t.side === "left"
+      ? `<span class="name">${t.name}<span class="dot"></span></span><span class="state">${t.what}</span>`
+      : `<span class="name"><span class="dot"></span>${t.name}</span><span class="state">${t.what}</span>`;
+    stage.appendChild(el);
+    tagEls[t.key] = el;
+    const labelX = t.side === "left" ? 1200 * 0.285 : 1200 * 0.715;
+    const labelY = 900 * t.y / 100;
+    wires.insertAdjacentHTML("beforeend",
+      `<line x1="${labelX}" y1="${labelY}" x2="${t.at[0]}" y2="${t.at[1]}"></line>` +
+      `<circle id="pin-${t.key}" cx="${t.at[0]}" cy="${t.at[1]}" r="7" fill="#737A85"></circle>`);
+  }
+  const TONE_COLOR = { good: "#1E8E4E", warn: "#B7791F", bad: "#C8373D", "": "#737A85" };
+
+  function setTag(key, tone, text) {
+    const el = tagEls[key];
+    if (!el) return;
+    el.dataset.tone = tone;
+    el.querySelector(".state").textContent = text;
+    const pin = document.getElementById("pin-" + key);
+    if (pin) pin.setAttribute("fill", TONE_COLOR[tone] || TONE_COLOR[""]);
+  }
+
+  function ago(sec) {
+    if (sec == null) return "never";
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return sec + " s ago";
+    if (sec < 3600) return Math.round(sec / 60) + " min ago";
+    return Math.round(sec / 3600) + " h ago";
+  }
+  function span(sec) {
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 90) return sec + " s";
+    if (sec < 5400) return Math.round(sec / 60) + " min";
+    const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+    return h + " h " + m + " min";
+  }
+  function clock(ts) {
+    return new Date(ts * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  function secs(ms) { return ms == null ? null : (ms / 1000).toFixed(1) + " s"; }
+
+  const AGENT_NAMES = {
+    chat: "Everyday chat", chat_embodied: "Chat with gestures", chatbot: "CS agent",
+    cs_direct: "CS Navigator directly", skills: "Utilities", action: "Voice command",
+    therapist: "Support", cbt_coach: "Support", grounding_coach: "Support", mi_coach: "Support",
+  };
+  const REASONS = {
+    no_voice: "No speech heard", hallucination_or_noise: "Only noise heard",
+    silero_no_speech: "No speech heard", self_echo: "NAO heard itself",
+    system_line_echo: "NAO heard itself", invalid_audio: "Audio could not be read",
+    mute_command: "Mute command",
+  };
+
+  let seenTurns = new Set();
+
+  function render(s) {
+    const now = s.now;
+    const r = s.robot, svc = s.services || {};
+    $("offline").hidden = true;
+    $("updated").textContent = "just now";
+    $("version").textContent = s.server.version;
+    $("uptime").textContent = span(now - s.server.started_at);
+
+    // Headline: one plain sentence about the robot.
+    let tone = "good", text, explain = "";
+    const deadKeys = Object.entries(svc).filter(([k, v]) => !v.ok && k !== "openai");
+    if (r.state === "online") {
+      text = r.muted ? "NAO is online and muted" : "NAO is online and listening";
+      if (deadKeys.length) {
+        tone = "bad";
+        text = "NAO is online but cannot answer";
+        explain = deadKeys.map(([k, v]) => `${svcName(k)}: ${v.detail}.`).join(" ") +
+          " Replace the key in the Pi's .env and restart nao-server.";
+      } else if (r.muted) {
+        tone = "warn"; explain = "Say \"you can talk\" or \"unmute\" to bring NAO's voice back.";
+      }
+    } else if (r.state === "program_down") {
+      tone = "bad"; text = "The robot is on but its program is not running";
+      explain = "Restart it: ssh nao, then run /home/nao/launch_nao_assist.sh, or power-cycle the robot.";
+    } else if (r.state === "offline") {
+      tone = "bad"; text = "NAO is offline";
+      explain = "The robot has not reported in and does not answer on the network. Check that it is powered on and on campus Wi-Fi.";
+    } else {
+      tone = "warn"; text = "Waiting to hear from NAO";
+      explain = "The robot has not connected since the Pi started. It reports in within a minute of starting.";
+    }
+    $("verdict").dataset.tone = tone;
+    $("verdictText").textContent = text;
+    $("explain").textContent = explain;
+
+    // Robot parts.
+    for (const k of ["deepgram", "elevenlabs", "claude", "cs_navigator", "openai"]) {
+      const v = svc[k];
+      if (!v) { setTag(k, "", "Checking"); continue; }
+      const t = v.ok ? "good" : (k === "openai" ? "warn" : "bad");
+      setTag(k, t, v.ok ? `${TAGS.find((x) => x.key === k).what}, ${v.ms} ms` : v.detail);
+    }
+    const robotTone = r.state === "online" ? "good" : r.state === "unknown" ? "warn" : "bad";
+    setTag("robot", robotTone, {
+      online: "Running", program_down: "Stopped, robot is on", offline: "Not reachable", unknown: "Not seen yet",
+    }[r.state]);
+    setTag("life", r.life_state == null ? "" : r.life_state === "disabled" ? "good" : "bad",
+      r.life_state == null ? "Unknown" : r.life_state === "disabled" ? "Off, as it should be" : `On (${r.life_state}), may steal the head`);
+    setTag("link", r.link_up ? "good" : "bad", r.link_up ? `Connected${r.ip ? ", " + r.ip : ""}` : "Disconnected");
+    setTag("pi", "good", `Up ${span(now - s.server.started_at)}`);
+
+    // Mobile list mirrors the tags.
+    $("taglist").innerHTML = TAGS.map((t) => {
+      const el = tagEls[t.key];
+      return `<li data-tone="${el.dataset.tone || ""}"><span><span class="dot" data-tone="${el.dataset.tone || ""}"></span>${t.name}</span><span class="state">${esc(el.querySelector(".state").textContent)}</span></li>`;
+    }).join("");
+
+    // Battery.
+    const b = r.battery;
+    $("batPct").textContent = b == null ? "?" : b + "%";
+    $("batFill").style.width = (b || 0) + "%";
+    $("batCell").dataset.tone = b == null ? "" : b < 20 ? "bad" : b < 40 ? "warn" : "good";
+    $("batCell").setAttribute("aria-label", b == null ? "Battery level unknown" : `Battery ${b} percent`);
+    $("batNote").textContent = b == null ? "Waiting for the robot"
+      : r.charging ? "Charging" : b < 20 ? "Low. Plug NAO in soon." : "On battery";
+    if (r.status_age_s != null && r.status_age_s > 90) $("batNote").textContent += `, last report ${ago(r.status_age_s)}`;
+
+    // Conversation feed.
+    const turns = s.turns || [];
+    if (!turns.length) {
+      $("feed").innerHTML = `<li class="empty">Nothing asked yet since the Pi started.</li>`;
+    } else {
+      $("feed").innerHTML = turns.map((t) => {
+        const id = t.ts + ":" + t.outcome + ":" + (t.question || "").slice(0, 20);
+        const isNew = seenTurns.size && !seenTurns.has(id);
+        const quiet = t.outcome !== "ok";
+        const who = AGENT_NAMES[t.agent] || (t.agent || "Not answered");
+        let q, a = "", by;
+        if (t.private) {
+          q = "Support conversation";
+          by = "Words hidden for privacy" + (t.first_audio_ms ? `, answered in ${secs(t.first_audio_ms)}` : "");
+        } else if (quiet) {
+          q = REASONS[t.reason] || (t.reason ? t.reason.replace(/_/g, " ") : "Not answered");
+          by = t.question ? `Heard: “${esc(t.question)}”` : "Dropped before reaching the brain";
+        } else {
+          q = esc(t.question || "(no words captured)");
+          a = t.reply ? `<p class="a">${esc(t.reply)}</p>` : "";
+          const bits = [who];
+          if (t.first_audio_ms) bits.push(`first words in ${secs(t.first_audio_ms)}`);
+          if (t.cs_navigator_ms) bits.push(`CS Navigator took ${secs(t.cs_navigator_ms)}`);
+          by = bits.join(", ");
+        }
+        return `<li class="turn${quiet ? " quiet" : ""}${t.private ? " private" : ""}${isNew ? " new" : ""}" data-id="${esc(id)}">
+          <time>${clock(t.ts)}</time>
+          <div><p class="q">${q}</p>${a}<p class="by">${by}</p></div></li>`;
+      }).join("");
+    }
+    seenTurns = new Set(turns.map((t) => t.ts + ":" + t.outcome + ":" + (t.question || "").slice(0, 20)));
+
+    // Today.
+    const d = s.today;
+    const fig = (n, label) => `<div class="fig"><b>${n}</b><span>${label}</span></div>`;
+    $("figures").innerHTML =
+      fig(d.answered, "questions answered") +
+      fig(d.cs, "Morgan CS questions") +
+      fig(d.support, "support turns") +
+      fig(d.dropped, "turns dropped") +
+      fig(d.median_first_audio_ms == null ? "?" : (d.median_first_audio_ms / 1000).toFixed(1) + " s", "typical wait for first words");
+
+    $("services").innerHTML = Object.keys(svcNames).map((k) => {
+      const v = svc[k];
+      const tone = !v ? "" : v.ok ? "good" : k === "openai" ? "warn" : "bad";
+      const detail = !v ? "Not checked yet" : `${v.detail}, checked ${ago(now - v.checked_at)}`;
+      return `<li class="svc"><span class="dot" data-tone="${tone}"></span>${svcNames[k]}<small>${esc(detail)}</small></li>`;
+    }).join("");
+
+    // Problems.
+    const p = s.problems || [];
+    $("problems").innerHTML = p.length
+      ? p.map((x) => `<li><time>${clock(x.ts)}</time><span class="lvl-${esc(x.level)}">${esc(problemName(x.event))}</span>${x.detail ? `<br><small>${esc(x.detail)}</small>` : ""}</li>`).join("")
+      : `<li class="empty">No problems logged since the Pi started.</li>`;
+  }
+
+  // Plain words for the problems people will actually see.
+  const PROBLEM_NAMES = {
+    agent_stream_error: "The brain did not answer",
+    cs_direct_lookup_failed: "CS Navigator lookup failed",
+    mute_ack_tts_failed: "Could not speak the mute reply",
+    speak_line_tts_failed: "Could not speak a reply",
+    elevenlabs_synth_returned_none: "ElevenLabs voice failed",
+    camera_consent_read_failed: "Could not read camera setting",
+    autonomous_life_redisabled: "Autopilot came back and was switched off",
+    turn_error: "A turn crashed",
+    wake_event_persist_failed: "Could not save a wake event",
+  };
+  const problemName = (e) => PROBLEM_NAMES[e] || (e.charAt(0).toUpperCase() + e.slice(1).replace(/_/g, " "));
+
+  const svcNames = {
+    claude: "Claude (brain)", deepgram: "Deepgram (hearing)", elevenlabs: "ElevenLabs (voice)",
+    cs_navigator: "CS Navigator", openai: "OpenAI (backup voice)",
+  };
+  const svcName = (k) => svcNames[k] || k;
+
+  let lastOk = Date.now();
+  async function tick() {
+    try {
+      const res = await fetch("/dashboard/api/state", { credentials: "same-origin", cache: "no-store" });
+      if (res.status === 401) return showGate();
+      if (res.status === 503) return showGate("The dashboard has no password yet. Set DASHBOARD_PASSWORD in the Pi's .env and restart nao-server.");
+      const s = await res.json();
+      $("gate").hidden = true; $("app").hidden = false;
+      lastOk = Date.now();
+      render(s);
+    } catch (e) {
+      if (!$("app").hidden) {
+        $("offline").hidden = false;
+        $("updated").textContent = ago((Date.now() - lastOk) / 1000);
+      }
+    }
+  }
+
+  function showGate(message) {
+    const wasHidden = $("gate").hidden;
+    $("app").hidden = true; $("gate").hidden = false;
+    if (message) { $("gateText").textContent = message; $("loginForm").hidden = true; }
+    if (wasHidden) $("pw").focus();  // only when the gate first appears
+  }
+
+  $("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("loginErr").textContent = "";
+    const res = await fetch("/dashboard/api/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: $("pw").value }), credentials: "same-origin",
+    }).catch(() => null);
+    if (res && res.ok) { $("pw").value = ""; tick(); }
+    else $("loginErr").textContent = res && res.status === 401 ? "That password is not right." : "Could not reach the Pi.";
+  });
+  $("logout").addEventListener("click", async () => {
+    await fetch("/dashboard/api/logout", { method: "POST", credentials: "same-origin" }).catch(() => null);
+    showGate();
+  });
+
+  tick();
+  setInterval(tick, 3000);
+})();
+</script>
+</body>
+</html>

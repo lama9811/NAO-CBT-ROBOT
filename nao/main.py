@@ -609,6 +609,68 @@ class _SessionController(object):
         self._face_tracker = None
         self._head_awareness = None
 
+    def _read_robot_status(self):
+        """Battery, charging, Life state, posture, motors. Best-effort."""
+        status = {}
+        if not _HAS_NAOQI:
+            return status
+        ip, port = config.NAO_IP, config.NAO_PORT
+        try:
+            status["battery"] = int(
+                ALProxy("ALBattery", ip, port).getBatteryCharge())
+        except Exception:
+            pass
+        try:
+            status["charging"] = bool(ALProxy("ALMemory", ip, port).getData(
+                "Device/SubDeviceList/Battery/Charge/Sensor/Charging"))
+        except Exception:
+            pass
+        try:
+            status["life_state"] = str(
+                ALProxy("ALAutonomousLife", ip, port).getState())
+        except Exception:
+            pass
+        try:
+            status["posture"] = str(
+                ALProxy("ALRobotPosture", ip, port).getPostureFamily())
+        except Exception:
+            pass
+        try:
+            status["awake"] = bool(
+                ALProxy("ALMotion", ip, port).robotIsWakeUp())
+        except Exception:
+            pass
+        return status
+
+    def _start_status_reports(self):
+        """Tell the Pi how the robot is doing every 30 s, for the dashboard."""
+        stop = threading.Event()
+        self._status_stop = stop
+
+        def _run():
+            while True:
+                client = self._client
+                if client is None:
+                    return
+                try:
+                    client.push_control("robot_status",
+                                        self._read_robot_status())
+                except Exception as exc:
+                    self._log.debug("robot_status_push_failed",
+                                    error=str(exc))
+                if stop.wait(30.0):
+                    return
+
+        t = threading.Thread(target=_run, name="nao-status-report")
+        t.daemon = True
+        t.start()
+
+    def _stop_status_reports(self):
+        stop = getattr(self, "_status_stop", None)
+        if stop is not None:
+            stop.set()
+        self._status_stop = None
+
     def _start_idle_posture_watch(self):
         """Sit NAO down after ``IDLE_SIT_S`` of silence; stand on new talk.
 
@@ -776,6 +838,7 @@ class _SessionController(object):
             #     than staring straight ahead.
             self._start_head_behaviors()
             self._start_idle_posture_watch()
+            self._start_status_reports()
 
             # 6. Onboarding face-recognition scan. Runs ~3 s after engage
             # on a daemon thread so the camera_announce + first turn
@@ -1183,6 +1246,7 @@ class _SessionController(object):
             pass
 
         self._stop_idle_posture_watch()
+        self._stop_status_reports()
         # Stop head-tracking before tearing down the WS so the head
         # doesn't keep tracking after we're done.
         try:

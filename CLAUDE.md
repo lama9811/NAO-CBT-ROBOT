@@ -709,6 +709,24 @@ deploy not using OpenAI.
   (measured 5.7s therapist alone vs 8.9s via router) even though
   `pick_initial_agent` already matched the emotional keyword in Python.
 
+## Live dashboard (since 2026-09-30)
+
+`http://<pi-ip>:5050/dashboard` on campus Wi-Fi (currently
+`http://172.20.95.112:5050/dashboard`). If the page will not load, the Pi is
+down. Shows robot online / program stopped / offline, battery, Autonomous
+Life state, the link to the Pi, a live check of every outside service
+(Claude, Deepgram, ElevenLabs, CS Navigator, OpenAI) every 5 min, the live
+conversation, today's numbers, and recent warnings.
+
+- Password: `DASHBOARD_PASSWORD` in the Pi's `.env`; falls back to
+  `NAO_SHARED_SECRET` when unset. No password configured = nothing served.
+- Support-agent and crisis turns are shown as "Support conversation" with no
+  words, by design. Everything is in memory only; a restart clears it.
+- Code: `server/dashboard.py` (fed by a structlog processor in
+  `logging_setup.py`, so no conversation code calls it) and
+  `server/dashboard_static/`. The robot sends `robot_status` every 30 s from
+  `nao/main.py`.
+
 ## Identity / face recognition
 
 Two stores, joined only by a **name string**:

@@ -934,7 +934,17 @@ async def _lifespan(_app: FastAPI):
         logging.getLogger("sage.app_ws").error(
             "migration runner failed on boot: %r", e,
         )
-    yield
+    # Live dashboard background checks (server/dashboard.py).
+    from server import dashboard as _dash
+    _dash_tasks = [
+        asyncio.create_task(_dash.run_checks_forever()),
+        asyncio.create_task(_dash.probe_robot_forever()),
+    ]
+    try:
+        yield
+    finally:
+        for t in _dash_tasks:
+            t.cancel()
 
 
 app = FastAPI(
@@ -942,6 +952,11 @@ app = FastAPI(
     version="phase-1",
     lifespan=_lifespan,
 )
+
+
+from server.dashboard import router as _dashboard_router  # noqa: E402
+
+app.include_router(_dashboard_router)
 
 
 @app.get("/health")
@@ -3878,6 +3893,11 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         )
         return True
 
+    if sub == "robot_status":
+        from server import dashboard as _dash
+        _dash.robot_status(data)
+        return True
+
     if sub == "speaker_identified":
         await _apply_speaker_identified(sess, data)
         return True
@@ -4003,6 +4023,11 @@ async def ws_handler(websocket: WebSocket, username: str) -> None:
 
     await websocket.accept()
     sess = _Session(username=username or "guest")
+    try:
+        from server import dashboard as _dash
+        _dash.robot_connected(getattr(websocket.client, "host", None))
+    except Exception:  # noqa: BLE001
+        pass
 
     logger.info(
         "ws_connected", user=sess.username, session_id=sess.session_id,

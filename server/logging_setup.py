@@ -84,6 +84,15 @@ def _utc_iso_ms(_logger, _name, event_dict):
     return event_dict
 
 
+def _dashboard_capture(logger, name, event_dict):
+    """Feed the live dashboard (server/dashboard.py). Never raises."""
+    try:
+        from server.dashboard import capture
+        return capture(logger, name, event_dict)
+    except Exception:  # noqa: BLE001
+        return event_dict
+
+
 def configure_logging() -> None:
     """Configure structlog + stdlib logging from env. Idempotent.
 
@@ -128,6 +137,7 @@ def configure_logging() -> None:
             structlog.processors.add_log_level,
             _utc_iso_ms,
             structlog.processors.format_exc_info,
+            _dashboard_capture,
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
