@@ -616,6 +616,18 @@ class WakeStateMachine(object):
             return
         self._transition(state, source="external")
 
+    def force_engage(self, gate="boot"):
+        """Engage without a face or touch, e.g. right after power-on.
+
+        Only acts from IDLE or AWARE, so it can never re-fire an already
+        open session. Returns True when it engaged.
+        """
+        with self._state_lock:
+            if self._state not in (STATE_IDLE, STATE_AWARE):
+                return False
+        self._transition(STATE_ENGAGED, source=gate, gate=gate)
+        return True
+
     def start(self):
         """Block until ``stop()`` is called.
 

@@ -408,6 +408,7 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
 | `AWARENESS_TTS_TAIL_S` | `0.8` | How long after NAO stops talking before the head may turn again. |
 | `FACE_RECO_MIN_SCORE` | `0.75` | Face-recognition score needed to trust a name; below it NAO uses no name. "Mason" was matched to Mingma at 0.646. |
 | `IDLE_SIT_S` | `90` | Sit after this long with nobody talking; stand again on the next real sentence. `0` = never sit. |
+| `AUTO_ENGAGE_ON_BOOT` | `1` | Open a conversation right after power-up, so NAO greets (camera line + "Hi, I'm NAO. How can I help you today?") with no tap. Face wake fired for only 2 of 8 wakes on 2026-09-30. `0` = tap/face only. |
 
 **The robot's launcher currently sets** `SPEAKING_GESTURES=0 BOOT_GREETING=0
 SOUND_LOCALIZER=0 FACE_TRACKER=1` (added 2026-08-24 on user request: no

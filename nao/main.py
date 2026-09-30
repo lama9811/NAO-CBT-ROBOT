@@ -247,6 +247,49 @@ def _disable_autonomous(ip, port):
             pass
 
 
+_boot_engage_done = False
+
+
+def _schedule_boot_engage(wsm, log):
+    """Open a conversation on power-up, with no tap or face needed.
+
+    Face wake rarely fired in practice (2 of 8 wakes on 2026-09-30; the
+    rest needed a head tap), and a session stays open once engaged, so
+    users were tapping NAO after every start. Engaging at boot makes NAO's
+    first words the camera line and "Hi, I'm NAO. How can I help you
+    today?" -- the "ready to chat" signal -- in its normal voice.
+    AUTO_ENGAGE_ON_BOOT=0 restores tap/face-only wake. Latched so the
+    crash-retry loop does not re-engage.
+    """
+    global _boot_engage_done
+    if _boot_engage_done:
+        return
+    if os.environ.get("AUTO_ENGAGE_ON_BOOT", "1").strip() == "0":
+        log.info("boot_engage_disabled")
+        return
+    _boot_engage_done = True
+
+    def _run():
+        # Let the WSM finish subscribing to faces/touch first.
+        for _ in range(40):
+            try:
+                if wsm.current_state() is not None:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.25)
+        time.sleep(2.0)
+        try:
+            engaged = wsm.force_engage("boot")
+            log.info("boot_engage", engaged=bool(engaged))
+        except Exception as exc:
+            log.warn("boot_engage_failed", error=str(exc))
+
+    t = threading.Thread(target=_run, name="nao-boot-engage")
+    t.daemon = True
+    t.start()
+
+
 def _start_life_guard(log):
     """Build the Autonomous Life guard and hold Life disabled at boot."""
     if not _HAS_NAOQI:
@@ -1363,6 +1406,7 @@ def main():
             # the first honest moment to claim "ready to talk". Latched
             # inside, so the crash-retry loop doesn't re-greet.
             _announce_ready(config.NAO_IP, config.NAO_PORT, log)
+            _schedule_boot_engage(wsm, log)
 
             wsm.start()  # blocks until stop()
             log.info("wake_state_machine_stopped")
