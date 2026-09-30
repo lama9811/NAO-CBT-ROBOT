@@ -134,7 +134,11 @@ def _synth_for(username: str, text: str,
                 "elevenlabs_synth_error",
                 user=username, error=repr(exc),
             )
-    # Default / fallback path.
+    # Default / fallback path. The OpenAI backup voice is off unless
+    # USE_OPENAI_TTS=1, so say plainly when a reply goes unspoken.
+    if not config.USE_OPENAI_TTS:
+        logger.warning("tts_failed_no_backup", user=username,
+                       text_preview=(text or "")[:80])
     return openai_tts.synthesize(text)
 
 

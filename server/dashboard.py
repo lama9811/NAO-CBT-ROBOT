@@ -351,6 +351,9 @@ SERVICE_CHECKS = {
     "elevenlabs": _elevenlabs,
     "cs_navigator": _cs_navigator,
 }
+# OpenAI is checked only if its backup voice is switched back on.
+if os.environ.get("USE_OPENAI_TTS", "0") != "1":
+    SERVICE_CHECKS.pop("openai", None)
 
 
 async def run_checks_forever(interval_s: float = 300.0) -> None:

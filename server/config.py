@@ -108,7 +108,11 @@ REALTIME_VAD_SILENCE_MS = int(os.environ.get("REALTIME_VAD_SILENCE_MS", "450"))
 # Female voices: nova (warm), shimmer (soft), coral, sage.
 OPENAI_TTS_VOICE = os.environ.get("OPENAI_TTS_VOICE", "nova")
 OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
-USE_OPENAI_TTS = os.environ.get("USE_OPENAI_TTS", "1") == "1"
+# OpenAI TTS was the backup voice when ElevenLabs failed. Removed as a
+# default on 2026-09-30 at the user's request: NAO has one voice, and if
+# ElevenLabs fails the turn is silent and logged (tts_failed_no_backup)
+# rather than answered in a different voice. USE_OPENAI_TTS=1 restores it.
+USE_OPENAI_TTS = os.environ.get("USE_OPENAI_TTS", "0") == "1"
 
 # Shared secret required on every HTTP/WS request (X-NAO-Secret header, or
 # {"secret": "..."} in the realtime WebSocket handshake). Empty string =

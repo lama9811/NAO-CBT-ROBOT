@@ -276,7 +276,6 @@
     { key: "elevenlabs",   name: "Voice",          what: "ElevenLabs",         at: [594, 132], side: "right", y: 19 },
     { key: "claude",       name: "Brain",          what: "Claude",             at: [640, 262], side: "right", y: 33 },
     { key: "cs_navigator", name: "Morgan CS",      what: "CS Navigator",       at: [660, 330], side: "right", y: 47 },
-    { key: "openai",       name: "Backup voice",   what: "OpenAI",             at: [724, 470], side: "right", y: 62 },
     { key: "robot",        name: "Robot program",  what: "NAO",                at: [470, 100], side: "left",  y: 11 },
     { key: "life",         name: "Built-in autopilot", what: "Autonomous Life", at: [470, 300], side: "left",  y: 32 },
     { key: "link",         name: "Link to the Pi", what: "WebSocket",          at: [455, 560], side: "left",  y: 58 },
@@ -356,7 +355,7 @@
 
     // Headline: one plain sentence about the robot.
     let tone = "good", text, explain = "";
-    const deadKeys = Object.entries(svc).filter(([k, v]) => !v.ok && k !== "openai");
+    const deadKeys = Object.entries(svc).filter(([k, v]) => !v.ok);
     if (r.state === "online") {
       text = r.muted ? "NAO is online and muted" : "NAO is online and listening";
       if (deadKeys.length) {
@@ -382,10 +381,10 @@
     $("explain").textContent = explain;
 
     // Robot parts.
-    for (const k of ["deepgram", "elevenlabs", "claude", "cs_navigator", "openai"]) {
+    for (const k of ["deepgram", "elevenlabs", "claude", "cs_navigator"]) {
       const v = svc[k];
       if (!v) { setTag(k, "", "Checking"); continue; }
-      const t = v.ok ? "good" : (k === "openai" ? "warn" : "bad");
+      const t = v.ok ? "good" : "bad";
       setTag(k, t, v.ok ? `${TAGS.find((x) => x.key === k).what}, ${v.ms} ms` : v.detail);
     }
     const robotTone = r.state === "online" ? "good" : r.state === "unknown" ? "warn" : "bad";
@@ -457,7 +456,7 @@
 
     $("services").innerHTML = Object.keys(svcNames).map((k) => {
       const v = svc[k];
-      const tone = !v ? "" : v.ok ? "good" : k === "openai" ? "warn" : "bad";
+      const tone = !v ? "" : v.ok ? "good" : "bad";
       const detail = !v ? "Not checked yet" : `${v.detail}, checked ${ago(now - v.checked_at)}`;
       return `<li class="svc"><span class="dot" data-tone="${tone}"></span>${svcNames[k]}<small>${esc(detail)}</small></li>`;
     }).join("");
@@ -476,6 +475,7 @@
     mute_ack_tts_failed: "Could not speak the mute reply",
     speak_line_tts_failed: "Could not speak a reply",
     elevenlabs_synth_returned_none: "ElevenLabs voice failed",
+    tts_failed_no_backup: "A reply went unspoken: the voice failed",
     camera_consent_read_failed: "Could not read camera setting",
     autonomous_life_redisabled: "Autopilot came back and was switched off",
     turn_error: "A turn crashed",
@@ -485,7 +485,7 @@
 
   const svcNames = {
     claude: "Claude (brain)", deepgram: "Deepgram (hearing)", elevenlabs: "ElevenLabs (voice)",
-    cs_navigator: "CS Navigator", openai: "OpenAI (backup voice)",
+    cs_navigator: "CS Navigator",
   };
   const svcName = (k) => svcNames[k] || k;
 

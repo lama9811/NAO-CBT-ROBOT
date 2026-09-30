@@ -10,7 +10,7 @@ NAO humanoid robot assistant for Morgan State University, built on the **OpenAI 
 |---|---|---|
 | **Ears** | Deepgram | `nova-3` batch REST, retrying once on `nova-2` when the first pass returns empty. **No OpenAI fallback** as of 2026-07-30 — see below. ElevenLabs Scribe is off (`USE_ELEVENLABS_STT=0`); ElevenLabs is TTS-only now. |
 | **Brain** | Anthropic | Haiku 4.5 for general chat/router/skills/embodied (fast, ~1s); Sonnet 5 for therapist + chatbot (depth); Opus 5 for crisis/safety. Chat moved off Sonnet 5 to Haiku on 2026-07-29 — Sonnet measured ~3.5s/reply (19.6s on tool-heavy turns), too slow for real-time. |
-| **Voice** | ElevenLabs | `eleven_flash_v2_5`, falls back to OpenAI `tts-1` |
+| **Voice** | ElevenLabs | `eleven_flash_v2_5`. No backup voice since 2026-09-30 (`USE_OPENAI_TTS` defaults to 0); a failed synth is logged as `tts_failed_no_backup` |
 | **Safety + CBT tools + vision** | *configurable* | `CRISIS_MODEL` / `VISION_MODEL` — OpenAI by code default, but the live Mac + Pi `.env` now point them at Claude (`claude-opus-5` / `claude-sonnet-5`) as of 2026-07-29 |
 
 `OPENAI_API_KEY` is still **mandatory**: `config.py:17` reads it with
