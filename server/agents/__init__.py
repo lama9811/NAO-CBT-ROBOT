@@ -1,4 +1,5 @@
 """Agent graph builders."""
+import re
 from server.agents.chat import (
     chat_agent, chat_embodied_agent, pure_chat_agent,
 )
@@ -46,10 +47,21 @@ _EMBODIED_TRIGGERS: tuple[str, ...] = (
 )
 
 _SPECIALIST_TRIGGERS: tuple[str, ...] = (
-    # Morgan / CS advising.
-    "morgan", "course", "class", "faculty", "professor", "advising",
-    "advisor", "prerequisite", "degree requirement", "major requirement",
-    "computer science department", "cs department", "schedule",
+    # Morgan / CS advising. These only send the question to the router,
+    # which makes the real call, so erring broad costs one router hop while
+    # missing a word means a CS question is answered from general chat
+    # (and possibly made up). "Who teaches COSC 220?" matched nothing here
+    # until 2026-09-30. Course codes are matched separately below.
+    "morgan", "msu", "course", "class", "faculty", "professor", "advising",
+    "advisor", "prerequisite", "pre-req", "prereq", "degree requirement",
+    "major requirement", "computer science", "comp sci",
+    "cs department", "cs major", "cs minor", "department", "schedule",
+    "who teaches", "instructor", "lecturer", "office hours",
+    "semester", "credit", "credits", "gpa", "graduat", "curriculum",
+    "syllabus", "elective", "internship", "co-op", "research lab",
+    "enroll", "register for", "registration", "websis", "degreeworks",
+    "degree works", "transfer credit", "concentration",
+    "cosc", "cybersecurity program", "data science program",
     # Utility lane.
     "what time", "today's date", "what date", "weather", "timer",
     "remind me", "reminder", "todo", "to-do",
@@ -60,6 +72,13 @@ _SPECIALIST_TRIGGERS: tuple[str, ...] = (
     "grief", "hopeless", "suicidal", "kill myself", "self harm",
     "therapy", "therapist", "cbt", "grounding exercise", "breathing exercise",
 )
+
+
+# "COSC 220", "cosc220", "Math 241", "CS 351": a department code plus a
+# three-digit number is a course, whatever else the sentence says.
+_COURSE_CODE_RE = re.compile(
+    r"\b(?:cosc|cs|math|eeng|ieng|clcs|phys|chem|biol|stat|engl|comp)"
+    r"\s*-?\s*\d{3}\b", re.IGNORECASE)
 
 
 def _wants_embodied(transcript: str | None) -> bool:
@@ -79,6 +98,8 @@ def _needs_specialist_router(transcript: str | None) -> bool:
     """
     t = (transcript or "").lower()
     if not t:
+        return True
+    if _COURSE_CODE_RE.search(t):
         return True
     return any(kw in t for kw in _SPECIALIST_TRIGGERS)
 
