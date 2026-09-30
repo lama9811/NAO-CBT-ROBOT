@@ -15,8 +15,6 @@ from server import dashboard as d
 @pytest.fixture(autouse=True)
 def fresh(monkeypatch):
     monkeypatch.setattr(d, "STATE", d._State())
-    monkeypatch.setenv("DASHBOARD_USER", "admin-test")
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "pw-test")
     yield
 
 
@@ -26,35 +24,17 @@ def _client():
     return TestClient(app)
 
 
-def test_state_needs_username_and_password():
+def test_status_is_open_to_anyone_with_the_link():
     c = _client()
-    assert c.get("/dashboard/api/state").status_code == 401
-    bad = [{"password": "pw-test"}, {"username": "admin-test", "password": "nope"},
-           {"username": "someone", "password": "pw-test"}]
-    for body in bad:
-        assert c.post("/dashboard/api/login", json=body).status_code == 401
-    ok = c.post("/dashboard/api/login",
-                json={"username": "Admin-Test", "password": "pw-test"})
-    assert ok.status_code == 200
-    assert c.get("/dashboard/api/state").status_code == 200
+    r = c.get("/dashboard/api/state")
+    assert r.status_code == 200 and "robot" in r.json()
+    assert c.post("/dashboard/api/login", json={}).status_code in (404, 405)
 
 
-def test_shared_secret_is_not_a_way_in(monkeypatch):
-    monkeypatch.delenv("DASHBOARD_USER", raising=False)
-    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
-    monkeypatch.setenv("NAO_SHARED_SECRET", "robot-secret")
-    c = _client()
-    r = c.post("/dashboard/api/login",
-               json={"username": "x", "password": "robot-secret"})
-    assert r.status_code == 503
-
-
-def test_no_password_configured_serves_nothing(monkeypatch):
-    monkeypatch.delenv("DASHBOARD_USER", raising=False)
-    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
-    c = _client()
-    assert c.get("/dashboard/api/state").status_code == 503
-    assert c.post("/dashboard/api/login", json={"password": ""}).status_code == 503
+def test_page_has_no_sign_in():
+    page = (d._STATIC / "index.html").read_text()
+    for gone in ('id="gate"', 'id="logout"', "/login"):
+        assert gone not in page
 
 
 def test_page_and_image_are_served():

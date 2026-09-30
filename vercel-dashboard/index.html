@@ -55,12 +55,6 @@
   .verdict[data-tone="bad"]  .lamp { background: var(--bad);  box-shadow: 0 0 0 0.14em color-mix(in srgb, var(--bad) 18%, transparent); }
   .mast-meta { text-align: right; color: var(--steel); font-size: 16px; }
   .mast-meta strong { color: var(--graphite); font-weight: 400; }
-  .mast-meta button {
-    margin-top: 8px; font: inherit; font-size: 15px; color: var(--steel);
-    background: none; border: 1px solid var(--hairline); border-radius: 999px;
-    padding: 4px 14px; cursor: pointer;
-  }
-  .mast-meta button:hover { color: var(--graphite); border-color: var(--steel); }
   .explain { grid-column: 1 / -1; margin: 0; max-width: 70ch; color: var(--steel); font-size: 19px; font-style: italic; }
 
   /* ── Main grid ── */
@@ -159,40 +153,6 @@
   .problems .lvl-error { color: var(--bad); }
 
   /* ── Login and offline states ── */
-  /* Sign-in: NAO on its white shell beside a short form. */
-  .gate {
-    max-width: 980px; margin: clamp(24px, 8vh, 96px) auto 0;
-    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    background: var(--shell); border-radius: 36px / 30px; overflow: hidden;
-    box-shadow: 0 1px 0 var(--hairline), 0 30px 80px -40px rgba(42, 45, 51, 0.4);
-  }
-  .gate-art { position: relative; background: var(--shell); min-height: 420px; }
-  .gate-art img { position: absolute; inset: 32px 0 0; width: 100%; height: calc(100% - 32px); object-fit: cover; object-position: 50% 0%; }
-  .gate-form { padding: clamp(28px, 5vw, 56px); border-left: 1px solid var(--hairline); background: var(--paper); }
-  .gate h1 { font-size: clamp(36px, 4.4vw, 52px); font-weight: 400; line-height: 1.02; margin: 0 0 10px; letter-spacing: -0.01em; }
-  .gate p { color: var(--steel); margin: 0; }
-  .gate label { display: block; margin: 22px 0 6px; font-size: 17px; }
-  .gate input {
-    width: 100%; font: inherit; padding: 12px 14px; border-radius: 12px;
-    border: 1px solid var(--hairline); background: var(--shell); color: var(--graphite);
-  }
-  .gate input:focus-visible { border-color: var(--eye); outline: 3px solid color-mix(in srgb, var(--eye) 25%, transparent); outline-offset: 0; }
-  .gate button {
-    margin-top: 24px; width: 100%; font: inherit; font-size: 19px; padding: 12px 22px; border-radius: 999px;
-    border: 0; background: var(--graphite); color: var(--shell); cursor: pointer;
-  }
-  .gate button:hover { background: #000; }
-  .gate button[disabled] { opacity: 0.6; cursor: progress; }
-  .gate .err { color: var(--bad); min-height: 1.4em; margin-top: 12px; }
-  .gate .setup { margin-top: 18px; padding: 12px 14px; border-radius: 12px; font-size: 16px;
-    background: color-mix(in srgb, var(--warn) 9%, var(--shell)); color: #7A5213; }
-  .gate .signedout { color: var(--good); margin-top: 12px; }
-  .gate .signedout:empty, .gate .err:empty { display: none; }
-  @media (max-width: 760px) {
-    .gate { grid-template-columns: 1fr; }
-    .gate-art { min-height: 240px; }
-    .gate-form { border-left: 0; border-top: 1px solid var(--hairline); }
-  }
   .banner {
     max-width: 1320px; margin: 16px auto 0; padding: 12px 18px; border-radius: 14px;
     background: color-mix(in srgb, var(--bad) 8%, var(--shell)); color: var(--bad);
@@ -218,25 +178,7 @@
 </head>
 <body>
 
-<section class="gate" id="gate" hidden aria-labelledby="gateTitle">
-  <div class="gate-art"><img id="gateImg" src="" alt="NAO robot, standing"></div>
-  <div class="gate-form">
-    <h1 id="gateTitle">NAO status</h1>
-    <p>Sign in to see how NAO and the Pi are doing.</p>
-    <form id="loginForm" novalidate>
-      <label for="user">Username</label>
-      <input id="user" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-      <label for="pw">Password</label>
-      <input id="pw" name="password" type="password" autocomplete="current-password" required>
-      <button type="submit" id="signIn">Sign in</button>
-      <div class="signedout" id="signedOut" role="status"></div>
-      <div class="err" id="loginErr" role="alert"></div>
-    </form>
-    <p class="setup" id="gateSetup" hidden></p>
-  </div>
-</section>
-
-<div id="app" hidden>
+<div id="app">
   <div class="banner" id="offline" role="alert" hidden>
     The Pi is not answering. It may be off, restarting, or off the network. This page keeps trying.
   </div>
@@ -246,7 +188,6 @@
     <div class="mast-meta">
       <div>Updated <strong id="updated">just now</strong></div>
       <div>Pi code <strong id="version">unknown</strong>, up <strong id="uptime">unknown</strong></div>
-      <button type="button" id="logout">Sign out</button>
     </div>
     <p class="explain" id="explain"></p>
   </header>
@@ -297,7 +238,6 @@
   const ON_PI = location.pathname.startsWith("/dashboard");
   const API = ON_PI ? "/dashboard/api" : "/api";
   $("naoImg").src = ON_PI ? "/dashboard/nao.jpg" : "/nao.jpg";
-  $("gateImg").src = $("naoImg").src;
   // On Vercel the Pi reports every 10 s; older than this means it stopped.
   const PI_STALE_S = 45;
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -545,55 +485,15 @@
   async function tick() {
     try {
       const res = await fetch(API + "/state", { credentials: "same-origin", cache: "no-store" });
-      if (res.status === 401) return showGate();
-      if (res.status === 503) return showGate(ON_PI
-        ? "The dashboard has no login yet. Set DASHBOARD_USER and DASHBOARD_PASSWORD in the Pi's .env and restart nao-server."
-        : "The dashboard has no login yet. Add DASHBOARD_USER and DASHBOARD_PASSWORD in the Vercel project's environment variables and redeploy.");
       const s = await res.json();
-      $("gate").hidden = true; $("app").hidden = false;
       lastOk = Date.now();
       render(s);
     } catch (e) {
-      if (!$("app").hidden) {
-        $("offline").hidden = false;
-        $("updated").textContent = ago((Date.now() - lastOk) / 1000);
-      }
+      $("offline").hidden = false;
+      $("updated").textContent = ago((Date.now() - lastOk) / 1000);
     }
   }
 
-  function showGate(setupNote) {
-    const wasHidden = $("gate").hidden;
-    $("app").hidden = true; $("gate").hidden = false;
-    $("gateSetup").hidden = !setupNote;
-    $("gateSetup").textContent = setupNote || "";
-    if (wasHidden) $("user").focus();  // only when the gate first appears
-  }
-
-  $("loginForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    $("loginErr").textContent = "";
-    $("signedOut").textContent = "";
-    if (!$("user").value.trim() || !$("pw").value) {
-      $("loginErr").textContent = "Enter your username and password.";
-      return;
-    }
-    $("signIn").disabled = true;
-    const res = await fetch(API + "/login", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: $("user").value, password: $("pw").value }), credentials: "same-origin",
-    }).catch(() => null);
-    $("signIn").disabled = false;
-    if (res && res.ok) { $("pw").value = ""; tick(); }
-    else if (res && res.status === 401) $("loginErr").textContent = "That username or password is not right.";
-    else if (res && res.status === 503) $("loginErr").textContent = "Sign-in is not set up on this server yet. See the note below.";
-    else $("loginErr").textContent = ON_PI ? "Could not reach the Pi." : "Could not reach the dashboard server.";
-  });
-  $("logout").addEventListener("click", async () => {
-    await fetch(API + "/logout", { method: "POST", credentials: "same-origin" }).catch(() => null);
-    showGate();
-    $("user").value = ""; $("pw").value = "";
-    $("signedOut").textContent = "You are signed out.";
-  });
 
   tick();
   setInterval(tick, 3000);

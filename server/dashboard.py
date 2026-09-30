@@ -15,6 +15,9 @@ Data sources, none of which touch the conversation code paths:
   free call (Claude, OpenAI, Deepgram, ElevenLabs, CS Navigator), so a dead
   API key shows up here instead of as a silent robot.
 
+Access: no login. Anyone with the link can view it (the user's choice,
+2026-09-30).
+
 Privacy: NAO is a support robot. Turns answered by the support agents, and
 anything crisis-related, are shown as "Support conversation" with no words.
 Nothing is written to disk; a restart clears the history.
@@ -23,8 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import hashlib
-import hmac
 import logging
 import os
 import socket
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 _STATIC = Path(__file__).parent / "dashboard_static"
@@ -470,38 +471,6 @@ def snapshot() -> dict[str, Any]:
         }
 
 
-# ──────────────────────────────── auth ────────────────────────────────────
-_COOKIE = "nao_dash"
-
-
-def _credentials() -> tuple[str, str]:
-    """Dashboard login: DASHBOARD_USER + DASHBOARD_PASSWORD, both required.
-
-    Deliberately no fallback to NAO_SHARED_SECRET: only people given the
-    dashboard login can open it.
-    """
-    return ((os.environ.get("DASHBOARD_USER") or "").strip(),
-            (os.environ.get("DASHBOARD_PASSWORD") or "").strip())
-
-
-def _configured() -> bool:
-    user, pw = _credentials()
-    return bool(user and pw)
-
-
-def _token(user: str, pw: str) -> str:
-    return hmac.new(pw.encode(), ("nao-dashboard-v2:" + user).encode(),
-                    hashlib.sha256).hexdigest()
-
-
-def _authed(request: Request) -> bool:
-    if not _configured():
-        return False
-    user, pw = _credentials()
-    got = request.cookies.get(_COOKIE, "")
-    return hmac.compare_digest(got, _token(user, pw))
-
-
 # ─────────────────────────────── routes ───────────────────────────────────
 router = APIRouter()
 
@@ -516,42 +485,8 @@ async def dashboard_image() -> Response:
     return FileResponse(_STATIC / "nao.jpg", media_type="image/jpeg")
 
 
-@router.post("/dashboard/api/login")
-async def dashboard_login(request: Request) -> Response:
-    if not _configured():
-        return JSONResponse({"ok": False, "error": "no_password"},
-                            status_code=503)
-    user, pw = _credentials()
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        body = {}
-    given_user = str((body or {}).get("username") or "").strip()
-    given_pw = str((body or {}).get("password") or "")
-    ok_user = hmac.compare_digest(given_user.lower().encode(),
-                                  user.lower().encode())
-    ok_pw = hmac.compare_digest(given_pw.encode(), pw.encode())
-    if not (ok_user and ok_pw):
-        await asyncio.sleep(0.5)  # blunt guessing
-        return JSONResponse({"ok": False, "error": "wrong_login"},
-                            status_code=401)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie(_COOKIE, _token(user, pw), httponly=True,
-                    samesite="strict", max_age=60 * 60 * 24 * 30)
-    return resp
-
-
-@router.post("/dashboard/api/logout")
-async def dashboard_logout() -> Response:
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie(_COOKIE)
-    return resp
-
-
 @router.get("/dashboard/api/state")
-async def dashboard_state(request: Request) -> Response:
-    if not _configured():
-        return JSONResponse({"error": "no_password"}, status_code=503)
-    if not _authed(request):
-        return JSONResponse({"error": "login"}, status_code=401)
-    return JSONResponse(snapshot())
+async def dashboard_state() -> Response:
+    # Open to anyone with the link, by the user's choice (2026-09-30).
+    # Support-agent and crisis turns never carry words regardless.
+    return JSONResponse(snapshot(), headers={"Cache-Control": "no-store"})

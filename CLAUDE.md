@@ -718,10 +718,9 @@ Life state, the link to the Pi, a live check of every outside service
 (Claude, Deepgram, ElevenLabs, CS Navigator, OpenAI) every 5 min, the live
 conversation, today's numbers, and recent warnings.
 
-- Login: `DASHBOARD_USER` + `DASHBOARD_PASSWORD` in the Pi's `.env` (also
-  kept in the Mac's `.env`). Both are required and there is deliberately no
-  fallback to `NAO_SHARED_SECRET`; with no login configured nothing is
-  served.
+- No login, by the user's choice (2026-09-30): anyone with the link can view
+  it, including the public Vercel copy. Only the Pi's reports to Vercel are
+  authenticated (`DASHBOARD_INGEST_SECRET`).
 - Support-agent and crisis turns are shown as "Support conversation" with no
   words, by design. Everything is in memory only; a restart clears it.
 - Hosted copy on Vercel: `vercel-dashboard/` (import the repo with Root
