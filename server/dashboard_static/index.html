@@ -179,9 +179,7 @@
 <body>
 
 <div id="app">
-  <div class="banner" id="offline" role="alert" hidden>
-    The Pi is not answering. It may be off, restarting, or off the network. This page keeps trying.
-  </div>
+  <div class="banner" id="offline" role="alert" hidden></div>
 
   <header class="mast">
     <h1 class="verdict" id="verdict" data-tone=""><span class="lamp"></span><span id="verdictText">Checking on NAO</span></h1>
@@ -482,15 +480,40 @@
   const svcName = (k) => svcNames[k] || k;
 
   let lastOk = Date.now();
+  // Say exactly what is wrong, in terms of what to do about it.
+  function problem(message) {
+    $("offline").textContent = message + " This page keeps trying.";
+    $("offline").hidden = false;
+    $("updated").textContent = ago((Date.now() - lastOk) / 1000);
+  }
+
   async function tick() {
+    let res;
     try {
-      const res = await fetch(API + "/state", { credentials: "same-origin", cache: "no-store" });
-      const s = await res.json();
+      res = await fetch(API + "/state", { credentials: "same-origin", cache: "no-store" });
+    } catch (e) {
+      return problem(ON_PI
+        ? "The Pi is not answering. It may be off, restarting, or off the network."
+        : "This dashboard's server is not answering. Check your internet connection.");
+    }
+    let s = null;
+    try { s = await res.json(); } catch (e) { s = null; }
+    if (!res.ok || !s) {
+      if (s && s.error === "no_database") {
+        return problem("The dashboard's database is not connected. In Vercel, open Storage, connect Upstash Redis to this project, then redeploy.");
+      }
+      if (res.status === 404) {
+        return problem(ON_PI
+          ? "The Pi is running older code without the dashboard. Push to main and wait two minutes."
+          : "The status endpoint is missing. In Vercel, set Root Directory to vercel-dashboard and redeploy.");
+      }
+      return problem(`The status request failed (HTTP ${res.status}). Check the Vercel function logs.`);
+    }
+    try {
       lastOk = Date.now();
       render(s);
     } catch (e) {
-      $("offline").hidden = false;
-      $("updated").textContent = ago((Date.now() - lastOk) / 1000);
+      problem("The dashboard received data it could not read: " + e.message + ".");
     }
   }
 

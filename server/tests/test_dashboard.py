@@ -158,3 +158,12 @@ def test_vercel_copy_matches_the_pi_page():
 def test_page_picks_its_api_by_location():
     page = (d._STATIC / "index.html").read_text()
     assert 'ON_PI ? "/dashboard/api" : "/api"' in page
+
+
+def test_page_explains_setup_problems_instead_of_blaming_the_pi():
+    """A Vercel site without its database used to say "The Pi is not
+    answering", sending people to check a Pi that was fine."""
+    page = (d._STATIC / "index.html").read_text()
+    assert 'error === "no_database"' in page
+    assert "connect Upstash Redis" in page
+    assert "Root Directory to vercel-dashboard" in page
