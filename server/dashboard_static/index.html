@@ -159,19 +159,40 @@
   .problems .lvl-error { color: var(--bad); }
 
   /* ── Login and offline states ── */
-  .gate { max-width: 440px; margin: 12vh auto 0; }
-  .gate h1 { font-size: 44px; font-weight: 400; margin: 0 0 8px; }
-  .gate p { color: var(--steel); }
-  .gate label { display: block; margin: 24px 0 8px; }
+  /* Sign-in: NAO on its white shell beside a short form. */
+  .gate {
+    max-width: 980px; margin: clamp(24px, 8vh, 96px) auto 0;
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    background: var(--shell); border-radius: 36px / 30px; overflow: hidden;
+    box-shadow: 0 1px 0 var(--hairline), 0 30px 80px -40px rgba(42, 45, 51, 0.4);
+  }
+  .gate-art { position: relative; background: var(--shell); min-height: 420px; }
+  .gate-art img { position: absolute; inset: 32px 0 0; width: 100%; height: calc(100% - 32px); object-fit: cover; object-position: 50% 0%; }
+  .gate-form { padding: clamp(28px, 5vw, 56px); border-left: 1px solid var(--hairline); background: var(--paper); }
+  .gate h1 { font-size: clamp(36px, 4.4vw, 52px); font-weight: 400; line-height: 1.02; margin: 0 0 10px; letter-spacing: -0.01em; }
+  .gate p { color: var(--steel); margin: 0; }
+  .gate label { display: block; margin: 22px 0 6px; font-size: 17px; }
   .gate input {
     width: 100%; font: inherit; padding: 12px 14px; border-radius: 12px;
     border: 1px solid var(--hairline); background: var(--shell); color: var(--graphite);
   }
+  .gate input:focus-visible { border-color: var(--eye); outline: 3px solid color-mix(in srgb, var(--eye) 25%, transparent); outline-offset: 0; }
   .gate button {
-    margin-top: 16px; font: inherit; padding: 10px 22px; border-radius: 999px;
+    margin-top: 24px; width: 100%; font: inherit; font-size: 19px; padding: 12px 22px; border-radius: 999px;
     border: 0; background: var(--graphite); color: var(--shell); cursor: pointer;
   }
+  .gate button:hover { background: #000; }
+  .gate button[disabled] { opacity: 0.6; cursor: progress; }
   .gate .err { color: var(--bad); min-height: 1.4em; margin-top: 12px; }
+  .gate .setup { margin-top: 18px; padding: 12px 14px; border-radius: 12px; font-size: 16px;
+    background: color-mix(in srgb, var(--warn) 9%, var(--shell)); color: #7A5213; }
+  .gate .signedout { color: var(--good); margin-top: 12px; }
+  .gate .signedout:empty, .gate .err:empty { display: none; }
+  @media (max-width: 760px) {
+    .gate { grid-template-columns: 1fr; }
+    .gate-art { min-height: 240px; }
+    .gate-form { border-left: 0; border-top: 1px solid var(--hairline); }
+  }
   .banner {
     max-width: 1320px; margin: 16px auto 0; padding: 12px 18px; border-radius: 14px;
     background: color-mix(in srgb, var(--bad) 8%, var(--shell)); color: var(--bad);
@@ -197,17 +218,22 @@
 </head>
 <body>
 
-<section class="gate" id="gate" hidden>
-  <h1>NAO status</h1>
-  <p id="gateText">Sign in to see how NAO and the Pi are doing.</p>
-  <form id="loginForm">
-    <label for="user">Username</label>
-    <input id="user" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
-    <label for="pw">Password</label>
-    <input id="pw" type="password" autocomplete="current-password" required>
-    <button type="submit">Sign in</button>
-    <div class="err" id="loginErr" role="alert"></div>
-  </form>
+<section class="gate" id="gate" hidden aria-labelledby="gateTitle">
+  <div class="gate-art"><img id="gateImg" src="" alt="NAO robot, standing"></div>
+  <div class="gate-form">
+    <h1 id="gateTitle">NAO status</h1>
+    <p>Sign in to see how NAO and the Pi are doing.</p>
+    <form id="loginForm" novalidate>
+      <label for="user">Username</label>
+      <input id="user" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+      <label for="pw">Password</label>
+      <input id="pw" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit" id="signIn">Sign in</button>
+      <div class="signedout" id="signedOut" role="status"></div>
+      <div class="err" id="loginErr" role="alert"></div>
+    </form>
+    <p class="setup" id="gateSetup" hidden></p>
+  </div>
 </section>
 
 <div id="app" hidden>
@@ -271,6 +297,7 @@
   const ON_PI = location.pathname.startsWith("/dashboard");
   const API = ON_PI ? "/dashboard/api" : "/api";
   $("naoImg").src = ON_PI ? "/dashboard/nao.jpg" : "/nao.jpg";
+  $("gateImg").src = $("naoImg").src;
   // On Vercel the Pi reports every 10 s; older than this means it stopped.
   const PI_STALE_S = 45;
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -534,26 +561,38 @@
     }
   }
 
-  function showGate(message) {
+  function showGate(setupNote) {
     const wasHidden = $("gate").hidden;
     $("app").hidden = true; $("gate").hidden = false;
-    if (message) { $("gateText").textContent = message; $("loginForm").hidden = true; }
+    $("gateSetup").hidden = !setupNote;
+    $("gateSetup").textContent = setupNote || "";
     if (wasHidden) $("user").focus();  // only when the gate first appears
   }
 
   $("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     $("loginErr").textContent = "";
+    $("signedOut").textContent = "";
+    if (!$("user").value.trim() || !$("pw").value) {
+      $("loginErr").textContent = "Enter your username and password.";
+      return;
+    }
+    $("signIn").disabled = true;
     const res = await fetch(API + "/login", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: $("user").value, password: $("pw").value }), credentials: "same-origin",
     }).catch(() => null);
+    $("signIn").disabled = false;
     if (res && res.ok) { $("pw").value = ""; tick(); }
-    else $("loginErr").textContent = res && res.status === 401 ? "That username or password is not right." : "Could not reach the Pi.";
+    else if (res && res.status === 401) $("loginErr").textContent = "That username or password is not right.";
+    else if (res && res.status === 503) $("loginErr").textContent = "Sign-in is not set up on this server yet. See the note below.";
+    else $("loginErr").textContent = ON_PI ? "Could not reach the Pi." : "Could not reach the dashboard server.";
   });
   $("logout").addEventListener("click", async () => {
     await fetch(API + "/logout", { method: "POST", credentials: "same-origin" }).catch(() => null);
     showGate();
+    $("user").value = ""; $("pw").value = "";
+    $("signedOut").textContent = "You are signed out.";
   });
 
   tick();
