@@ -46,7 +46,9 @@ params are removed on current Claude models — Opus 5 returns
 `400 temperature is deprecated for this model`.
 
 Pinecone is **gone** — RAG is now an HTTP proxy to Cloud Run
-(`server/tools/cs_navigator.py`, `vertex_search.py`). No embeddings anywhere.
+(`server/tools/cs_navigator.py`). No embeddings anywhere. The Vertex AI
+Search fallback was deleted 2026-09-30; `CS_NAVIGATOR_URL` now defaults to the
+public backend, so a `.env` without it still answers CS questions.
 
 ## Repo Layout
 
@@ -148,8 +150,13 @@ Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morg
 
 ## NAO Robot — Connection
 
-- **IP: unknown — re-resolve every session.** `.100` was right on 2026-08-24 and
-  was already wrong by 2026-09-03. The lease has moved `.127` → `.123`
+- **IP: unknown — re-resolve every session.** Last seen `172.20.95.121` on
+  2026-09-30 (mDNS `nao.local` resolved it first try; `.101` in `.env` and
+  `~/.ssh/config` was stale). The Pi moved too: `172.20.95.112` on
+  2026-09-30 (`naoserver.local` resolves from the robot but **not** from a
+  Mac; `.123` was `(incomplete)` in ARP). It serves on **port 5050**, not
+  8000 — probe the right port or a live Pi looks dead.
+  `.100` was right on 2026-08-24 and was already wrong by 2026-09-03. The lease has moved `.127` → `.123`
   (2026-07-15 → 07-28), `.123` → `.100` (by 08-24, when the **Pi took over the
   robot's old `.123`**), and off `.100` since. A stale `ssh nao` lands you on the
   Pi, and a stale `NAO_IP` makes `run.sh` rsync Python 2.7 robot code onto the
@@ -162,6 +169,12 @@ Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morg
 - **Don't trust `.env`'s `NAO_IP` either.** On 2026-09-03 it read `172.20.95.101`,
   which was a **WNC Corporation** device (a phone), not the robot — see the MAC
   vendor trick under "Debugging the robot".
+- **When it does change, update all three places that carry it** — they drift
+  independently: `NAO_IP` in `.env` (`run.sh` reads it), `HostName` under
+  `Host nao` in `~/.ssh/config`, and this file. If mDNS is down, ARP + a port
+  probe is what finds live hosts: `arp -an | grep 172.20.95`, then
+  `nc -z -G 3 <ip> 22` on each candidate — an `(incomplete)` entry means
+  nothing is there; a MAC with no port 22 is some other device.
 - **Hostname:** `nao.local` (mDNS fallback)
 - **User:** `nao`
 - **Password:** stored in `.env` as `NAO_PASSWORD` (do NOT commit the password; `.env` is gitignored). Only needed for the initial key push — passwordless SSH is now configured (see below).
@@ -229,7 +242,7 @@ source of confusion:
 | | Runs | Address | When |
 |---|---|---|---|
 | **NAO robot** | `nao/` (Python 2.7) | *DHCP — ask the robot (chest button)* | always |
-| **Raspberry Pi 4** | `server/` via systemd `nao-server` | `172.20.95.123` | production / demos |
+| **Raspberry Pi 4** | `server/` via systemd `nao-server` | *DHCP too* — `.112` on 2026-09-30, `.123` before | production / demos |
 | **Your laptop** | `server/` via `./run.sh` | your LAN IP | development |
 
 The Pi is the always-on brain so the robot works with nobody's laptop around
@@ -382,12 +395,19 @@ a bare `rsync --delete nao/ ...` **deletes the robot's live log file**.
 | Var | Default | Notes |
 |---|---|---|
 | `MIC_CHANNEL` | `left` | Which of NAO's 4 mics to record. Re-measured 2026-07-30 on one 4-channel recording of a single source: LEFT rms 10003, RIGHT 10067, FRONT 6614, REAR 6147 — LEFT/RIGHT are ~1.5× the other two, so the default is right. `left\|right\|front\|rear\|all`. |
-| `ENGAGE_POSTURE` | `Sit` (code) | Posture on wake; `.env` currently overrides to `Stand`. `Sit` saves battery and mic noise; `none` disables. |
+| `ENGAGE_POSTURE` | `Stand` (code, since 2026-09-30) | Posture on wake and on head touch. It defaulted to `Sit` and the robot's launcher never sets it, so every head touch sat NAO down mid-chat. `none` disables. |
 | `SPEAKING_GESTURES` | `1` | `0` stops arm micro-gestures during TTS. |
 | `BOOT_GREETING` | `1` | NAO says `BOOT_GREETING_TEXT` and waves once it's ready to talk (after mic/TTS/LEDs/wake gates are built, just before `wsm.start()`). Latched once per process so the crash-retry loop doesn't re-greet. `0` disables. |
 | `BOOT_GREETING_TEXT` | `Hello, I'm NAO. How can I help you?` | Reword without a code change. Spoken by **native** NAOqi TTS, which is unmuted and re-muted to 0.0 in a `finally` — if that restore ever breaks, the kid voice leaks into every ElevenLabs reply. |
 | `SOUND_LOCALIZER` | `1` | `0` stops NAO aiming its head at whoever just spoke. **Currently `0` on the robot.** `sound_localize.py` has no TTS gating, so while NAO talks its own speaker is the loudest source in the room and it turns to face itself — it looks away precisely while answering. Turning it off leaves the face tracker holding eye contact. The real fix is to gate it during TTS so off-axis speakers still get a head-turn. |
 | `FACE_TRACKER` | `1` | `0` stops ALTracker following a face with the camera. Left **on** — this is what keeps NAO looking at the user. |
+| `HEAD_AWARENESS` | `1` | `nao/awareness.py`: turns the head toward whoever speaks (ALSoundLocalization), holds it, and lets ALTracker lock onto their face; ignores sound while NAO talks. **Replaces** `SOUND_LOCALIZER` + `FACE_TRACKER` when on. NAOqi's ALBasicAwareness is switched off: it looked away after 1 s whenever its person detector found nobody, which on this robot was always. |
+| `VOICE_TURN_MIN_CONF` | `0.15` | Localizer confidence needed to turn. Real speech measured 0.1-0.5. |
+| `VOICE_TURN_MAX_DEG` | `80` | Sounds further round than this are ignored (NAO sits with a wall behind it; a wall echo once parked the head at -100 deg). |
+| `VOICE_TURN_RECENTER_S` | `4.0` | With no face found after a turn for this long, glide back to the front. |
+| `AWARENESS_TTS_TAIL_S` | `0.8` | How long after NAO stops talking before the head may turn again. |
+| `FACE_RECO_MIN_SCORE` | `0.75` | Face-recognition score needed to trust a name; below it NAO uses no name. "Mason" was matched to Mingma at 0.646. |
+| `IDLE_SIT_S` | `90` | Sit after this long with nobody talking; stand again on the next real sentence. `0` = never sit. |
 
 **The robot's launcher currently sets** `SPEAKING_GESTURES=0 BOOT_GREETING=0
 SOUND_LOCALIZER=0 FACE_TRACKER=1` (added 2026-08-24 on user request: no
@@ -426,8 +446,7 @@ measuring and wrong that there is nothing to fix.
 ### Server-side gotchas
 
 - **CS Navigator was wired but unreachable until 2026-07-30.** `chatbot.py`
-  imports `cs_navigator_search` (falling back to `vertex_search` only if that
-  import fails — it doesn't), but `CS_NAVIGATOR_URL` was empty on the Pi, so
+  imports `cs_navigator_search`, but `CS_NAVIGATOR_URL` was empty on the Pi, so
   every Morgan CS question returned the tool's polite *"I couldn't reach the CS
   Navigator just now"* instead of an answer. It degrades quietly, so nothing
   looked broken. Now set to
@@ -544,6 +563,54 @@ absent OpenAI key that is a wasted round-trip per turn; set it to `0` on any
 deploy not using OpenAI.
 
 ### Known bugs
+
+- **"Camera off" did nothing, and NAO triggered it on itself — FIXED
+  2026-09-30.** Three faults. (1) The camera heads-up said *"Say 'stop
+  watching me' anytime"*, which is itself a `disable_camera` voice command,
+  and NAO hears its own speaker. (2) Both echo guards tokenized the quoted
+  words as `'stop` / `me'`, so the echo *"Station. Say stop watching me
+  anytime."* scored under both thresholds; now `_echo_tokens()` strips edge
+  quotes. (3) The voice fast-path only sent a `disable_camera` action that
+  the robot logged as `unknown action`, and never saved consent — NAO said
+  "Camera off." and kept sending a photo after every reply (1,000+ that
+  day). Now `_apply_camera_choice` persists consent and sends a
+  `camera_state` control; the robot stops snapping while off; the server
+  also drops inbound frames and stashed frames when consent is off, and
+  sends the saved state at `session_open`. The announcement was reworded to
+  contain no command. Tests: `server/tests/test_camera_off_real.py`.
+
+- **ALSoundLocalization is parsed wrong on NAOqi 2.8 — FIXED 2026-09-30.**
+  2.8 stores `[ts, [azimuth, elevation, confidence, energy], head6D, head6D]`;
+  `sound_localize.py` read `[ts, [conf, energy], [az, ...]]`, so the
+  "direction" was the head's x position (always 0.0) and "confidence" was the
+  azimuth. Every voice-turn feature built on it silently never had a
+  direction. `awareness.parse_sound_event` handles both layouts; azimuth is
+  relative to the head, so the target yaw is `head_wz + azimuth`.
+- **One identity per conversation — FIXED 2026-09-30.** Identity was fixed at
+  wake and `user_identified` is deliberately sticky, so after a weak face
+  match to "Mason" NAO called every later speaker Mason. The robot now
+  re-scans the face after each voice turn and sends `speaker_identified`;
+  the server rebinds to that name or to an anonymous guest (never merging
+  histories). Tests: `server/tests/test_speaker_switch.py`.
+- **NAO locked onto one person because Autonomous Life kept coming back — FIXED
+  2026-09-30.**
+  `main._disable_autonomous` disabled Life once at boot, but NAOqi 2.8's Life
+  finishes its *own* boot ~2 s later ("Starting life after boot config") and
+  goes to `solitary`, then flips to `interactive` whenever someone walks up —
+  17 flips in 12 minutes on the day it was found. In `interactive`, Life sets
+  `ALBasicAwareness` to **FullyEngaged** on the first person and ignores every
+  other voice, while our ALTracker sat inactive. Symptom: NAO looks at and
+  answers whoever woke it; a second speaker is off-axis, arrives too faint for
+  Deepgram (rejected clips were far quieter than close speech), and is dropped.
+  Fix: `nao/awareness.py` `LifeGuard` re-disables until Life stays down at boot
+  and watchdogs it during sessions (entering `disabled` calls
+  `ALMotion.rest()`, so a mid-session re-disable re-stands the robot), and
+  `HeadAwareness` runs BasicAwareness ourselves in `Unengaged` mode. Read Life's
+  real state with `journalctl -t life.autonomouslife` on the robot — our own
+  logs never show it. Tests: `server/tests/test_head_awareness.py`.
+- **`run.sh` deploy deleted the robot's `logs/` — FIXED 2026-09-30.** Its
+  `rsync --delete` excluded `nao.log` but not `logs/`, the dated JSONL folder,
+  which exists only on the robot. Every `./run.sh` wiped the structured logs.
 
 - **Anonymous chat history leaked between people — FIXED 2026-08-24 (`875badb`).**
   `session.get_or_create_session` keyed the SDK `SQLiteSession` by
