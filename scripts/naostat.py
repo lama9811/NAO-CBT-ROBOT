@@ -8,8 +8,27 @@
                                       whenever the known addresses all miss)
     ./scripts/naostat.py --no-color   plain text
 
-Stdlib only; runs on the Mac's python3. Every panel reports what it actually
-measured -- a field it could not read prints "--", never a guess.
+Stdlib only, Python 3.9+, macOS / Linux / Windows. Every panel reports what it
+actually measured -- a field it could not read prints "--", never a guess.
+
+RUNNING IT ON A DIFFERENT MACHINE
+  1. git clone https://github.com/lama9811/NAO-CBT-ROBOT.git
+     cd NAO-CBT-ROBOT && ./scripts/naostat.py
+     (no venv, no pip install; on Windows: python scripts\naostat.py)
+  2. Install an SSH key that the robot and the Pi accept. THIS is the step
+     people miss: every number below is read over ssh, so a machine without a
+     key shows the entire fleet as offline. Either copy ~/.ssh/id_ed25519 and
+     its .pub from a machine that already works (chmod 600 the private key),
+     or enrol this one:
+         ssh-keygen -t ed25519
+         ssh-copy-id nao@<pi-ip>
+         ssh-copy-id nao@<robot-ip>
+     ssh-copy-id prompts for NAO_PASSWORD and must be typed in a real
+     terminal -- it fails instantly from a script. The report says outright
+     when a key was rejected, rather than calling the host offline.
+  3. Be on the same LAN as the robot. Not a VPN, not a guest SSID.
+  No .env is needed: it only ever supplied address hints, and discovery no
+  longer depends on them.
 
 Two house rules from CLAUDE.md are baked in:
   * never ping to test reachability -- this network drops ICMP
@@ -39,6 +58,11 @@ REPO = Path(__file__).resolve().parent.parent
 ENV = REPO / ".env"
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 PI_REPO = "~/nao-sagecbt"
+
+# Hosts that answered but rejected our key. Tracked so the report can say
+# "this laptop has no key here" instead of "the robot is offline" -- on a new
+# machine those look identical, and the wrong one sends you to the robot.
+SSH_AUTH_FAILURES: set[str] = set()
 
 SSH = [
     "ssh",
@@ -110,19 +134,24 @@ def bar(pct: float, cells: int = 16, tone: str = "") -> str:
 
 # ---------------------------------------------------------------- primitives
 
-def run(cmd: list[str], timeout: int = 12) -> tuple[int, str]:
-    """Return (rc, stdout). stderr is dropped on purpose: the robot's sshd
-    prints a multi-line warning banner there, and merging it into stdout makes
-    the banner read as the first line of every command's output -- which turned
-    `hostname` into a warning string and let any host pass as the robot."""
+def run(cmd: list[str], timeout: int = 12) -> tuple[int, str, str]:
+    """Return (rc, stdout, stderr), kept apart.
+
+    They must never be merged: the robot's sshd prints a multi-line warning
+    banner on stderr, and folding that into stdout makes the banner the first
+    line of every command's output -- which turned `hostname` into a warning
+    string and let any host pass as the robot. stderr is still wanted, though,
+    because "Permission denied (publickey)" is how a missing SSH key announces
+    itself, and that must not be reported as a robot that is switched off.
+    """
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout or ""
+        return p.returncode, p.stdout or "", p.stderr or ""
     except (subprocess.TimeoutExpired, OSError):
-        return 124, ""
+        return 124, "", ""
 
 
-def ssh(host: str, script: str, timeout: int = 15, attempts: int = 1) -> tuple[int, str]:
+def ssh(host: str, script: str, timeout: int = 15, attempts: int = 1) -> tuple[int, str, str]:
     """Run a script over ssh, optionally retrying.
 
     The robot's WiFi link drops connects perfectly often -- measured at 3 of 5
@@ -130,14 +159,18 @@ def ssh(host: str, script: str, timeout: int = 15, attempts: int = 1) -> tuple[i
     connect therefore means nothing, so anything that concludes "not there"
     from a miss has to retry first.
     """
-    rc, out = 124, ""
+    rc, out, err = 124, "", ""
     for i in range(max(1, attempts)):
-        rc, out = run(SSH + [host, script], timeout=timeout)
+        rc, out, err = run(SSH + [host, script], timeout=timeout)
         if rc == 0 and out.strip():
-            return rc, out
+            return rc, out, err
+        low = err.lower()
+        if "permission denied" in low or "host key verification failed" in low:
+            SSH_AUTH_FAILURES.add(host.split("@")[-1])
+            break          # a rejected key will be rejected again; do not retry
         if i + 1 < attempts:
             time.sleep(1.0)
-    return rc, out
+    return rc, out, err
 
 
 def port_open(ip: str, port: int = 22, timeout: float = 1.2) -> bool:
@@ -180,11 +213,24 @@ def ssh_config_host(alias: str) -> str | None:
 
 
 def local_subnet() -> str | None:
-    rc, out = run(["ipconfig", "getifaddr", "en0"], timeout=4)
-    ip = out.strip()
-    if rc or not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+    """The /24 this machine is on, on any OS.
+
+    A UDP socket "connected" to an off-machine address sends no packets -- it
+    just makes the kernel pick the outbound interface, which is the one facing
+    the robot. The previous version shelled out to `ipconfig getifaddr en0`,
+    which exists only on macOS, so the sweep fallback silently did nothing on
+    Linux and Windows -- exactly the machines most likely to need it.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
         return None
-    return ip.rsplit(".", 1)[0]
+    return ip.rsplit(".", 1)[0] if IPV4.match(ip) else None
 
 
 def sweep(prefix: str) -> list[str]:
@@ -228,8 +274,8 @@ def identify(ip: str) -> dict:
     /etc/os-release is the reliable tell -- its hostname is plain "nao", which
     is too generic to bet on alone.
     """
-    rc, out = ssh(f"nao@{ip}", "hostname; cat /etc/os-release 2>/dev/null",
-                  timeout=10, attempts=3)
+    rc, out, _ = ssh(f"nao@{ip}", "hostname; cat /etc/os-release 2>/dev/null",
+                     timeout=10, attempts=3)
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     if rc != 0 or not lines:
         return {}
@@ -271,7 +317,7 @@ def hints_from_pi(pi_ip: str | None) -> list[str]:
         "ss -tn 2>/dev/null | awk '/:5050/{print $5}' | cut -d: -f1; "
         "ip neigh 2>/dev/null | grep -vE 'FAILED|INCOMPLETE' | awk '{print $1}'"
     )
-    _, out = ssh(f"nao@{pi_ip}", script, timeout=12)
+    _, out, _err = ssh(f"nao@{pi_ip}", script, timeout=12)
     seen, ips = set(), []
     for line in out.splitlines():
         ip = line.strip()
@@ -381,7 +427,7 @@ def collect_robot(scan: bool, pi_ip: str | None = None) -> dict:
     info = find_robot(scan, pi_ip)
     if not info["ip"]:
         return {"up": False, **info}
-    rc, out = ssh(f"nao@{info['ip']}", ROBOT_PROBE, timeout=20, attempts=3)
+    rc, out, _ = ssh(f"nao@{info['ip']}", ROBOT_PROBE, timeout=20, attempts=3)
     raw = parse_kv(out)
     return {"up": bool(raw), "raw": raw, **info}
 
@@ -390,18 +436,18 @@ def collect_pi(info: dict | None = None) -> dict:
     info = info if info is not None else find_pi()
     if not info.get("ip"):
         return {"up": False, **info}
-    rc, out = ssh(f"nao@{info['ip']}", PI_PROBE, timeout=25)
+    rc, out, _ = ssh(f"nao@{info['ip']}", PI_PROBE, timeout=25)
     raw = parse_kv(out)
     return {"up": bool(raw.get("uptime")), "raw": raw, **info}
 
 
 def collect_local() -> dict:
     d = {}
-    rc, out = run(["git", "-C", str(REPO), "rev-parse", "--abbrev-ref", "HEAD"], timeout=6)
+    rc, out, _ = run(["git", "-C", str(REPO), "rev-parse", "--abbrev-ref", "HEAD"], timeout=6)
     d["branch"] = out.strip() if rc == 0 else None
-    rc, out = run(["git", "-C", str(REPO), "log", "-1", "--format=%h %cd %s", "--date=short"], timeout=6)
+    rc, out, _ = run(["git", "-C", str(REPO), "log", "-1", "--format=%h %cd %s", "--date=short"], timeout=6)
     d["head"] = out.strip()[:58] if rc == 0 else None
-    rc, out = run(["git", "-C", str(REPO), "status", "--porcelain"], timeout=8)
+    rc, out, _ = run(["git", "-C", str(REPO), "status", "--porcelain"], timeout=8)
     d["dirty"] = len([l for l in out.splitlines() if l.strip()]) if rc == 0 else None
 
     pid_file = REPO / "logs" / "server.pid"
@@ -417,7 +463,7 @@ def collect_local() -> dict:
     venv = REPO / ".venv" / "bin" / "python"
     d["venv"] = None
     if venv.exists():
-        rc, out = run([str(venv), "-V"], timeout=8)
+        rc, out, _ = run([str(venv), "-V"], timeout=8)
         d["venv"] = out.strip() if rc == 0 else None
     return d
 
@@ -557,11 +603,34 @@ def render_local(l: dict, pi: dict) -> list[str]:
     return lines
 
 
+def render_auth_warning() -> list[str]:
+    """A host that rejected our key is not a host that is switched off.
+
+    Without this, a laptop with no key installed shows the whole fleet as
+    offline -- which reads as "the robot is broken" and sends you to go and
+    poke the robot, when the fix is three commands on this machine.
+    """
+    if not SSH_AUTH_FAILURES:
+        return []
+    hosts = ", ".join(sorted(SSH_AUTH_FAILURES))
+    return [
+        f"  {C.yellow}{C.bold}! SSH key not accepted by: {hosts}{C.reset}",
+        f"  {C.grey}  Those hosts are UP -- this machine just cannot log in, so"
+        f" every field below reads empty.{C.reset}",
+        f"  {C.grey}  Fix on THIS machine:  ssh-keygen -t ed25519   then"
+        f"  ssh-copy-id nao@<host>{C.reset}",
+        f"  {C.grey}  ssh-copy-id asks for NAO_PASSWORD and must be run in a"
+        f" real terminal, not a script.{C.reset}",
+        "",
+    ]
+
+
 def render(robot: dict, pi: dict, local: dict) -> str:
     out = []
     stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z")
     out.append(f"{C.bold}{C.cyan}NAO fleet{C.reset}  {C.grey}{stamp}{C.reset}")
     out.append("")
+    out += render_auth_warning()
     out += render_robot(robot)
     out.append("")
     out += render_pi(pi)
