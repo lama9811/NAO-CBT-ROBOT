@@ -1,0 +1,23 @@
+# NAO dashboard on Vercel
+
+A hosted copy of the Pi's `/dashboard`. The Pi is on Morgan's private
+network, so this site never contacts it; the Pi posts its status to
+`/api/ingest` every 10 seconds and this site stores the latest copy in
+Upstash Redis.
+
+`index.html` and `nao.jpg` are copies of `server/dashboard_static/`; a test
+fails if they drift. Edit the originals and copy them here.
+
+## Setup
+
+1. vercel.com: Add New, Project, import this repo, set Root Directory to
+   `vercel-dashboard`, deploy.
+2. Project: Storage, Upstash Redis, connect (free plan).
+3. Project: Settings, Environment Variables:
+   `DASHBOARD_USER`, `DASHBOARD_PASSWORD`, `DASHBOARD_INGEST_SECRET`.
+   Redeploy.
+4. Pi `.env`: `DASHBOARD_REMOTE_URL=https://<your-site>.vercel.app` and the
+   same `DASHBOARD_INGEST_SECRET`, then restart nao-server.
+
+Support-agent and crisis turns are never sent. Set
+`DASHBOARD_PUSH_CONVERSATION=0` on the Pi to send status only.

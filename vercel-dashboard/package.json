@@ -1,0 +1,9 @@
+{
+  "name": "nao-dashboard",
+  "private": true,
+  "type": "module",
+  "description": "Hosted NAO status dashboard. The Pi pushes status here; see README.md.",
+  "dependencies": {
+    "@upstash/redis": "^1.34.0"
+  }
+}

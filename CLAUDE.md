@@ -724,6 +724,13 @@ conversation, today's numbers, and recent warnings.
   served.
 - Support-agent and crisis turns are shown as "Support conversation" with no
   words, by design. Everything is in memory only; a restart clears it.
+- Hosted copy on Vercel: `vercel-dashboard/` (import the repo with Root
+  Directory = `vercel-dashboard`; see its README). The Pi cannot be reached
+  from the cloud, so it POSTs its snapshot to `DASHBOARD_REMOTE_URL/api/ingest`
+  every 10 s with `DASHBOARD_INGEST_SECRET`; the site keeps the latest copy
+  in Upstash Redis and shows "The Pi has stopped reporting" after 45 s of
+  silence. `DASHBOARD_PUSH_CONVERSATION=0` sends status only. The page and
+  photo are copies of `server/dashboard_static/`; a test fails on drift.
 - Code: `server/dashboard.py` (fed by a structlog processor in
   `logging_setup.py`, so no conversation code calls it) and
   `server/dashboard_static/`. The robot sends `robot_status` every 30 s from

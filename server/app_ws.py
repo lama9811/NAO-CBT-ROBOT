@@ -943,6 +943,7 @@ async def _lifespan(_app: FastAPI):
     _dash_tasks = [
         asyncio.create_task(_dash.run_checks_forever()),
         asyncio.create_task(_dash.probe_robot_forever()),
+        asyncio.create_task(_dash.push_remote_forever()),
     ]
     try:
         yield

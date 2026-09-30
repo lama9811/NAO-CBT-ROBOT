@@ -373,6 +373,53 @@ async def probe_robot_forever(interval_s: float = 20.0) -> None:
         await asyncio.sleep(interval_s)
 
 
+# ─────────────────────────── remote (Vercel) push ─────────────────────────
+def _remote_payload() -> dict[str, Any]:
+    """What the Pi sends to the hosted dashboard.
+
+    Support-agent and crisis turns never carry words (see _turn_from).
+    DASHBOARD_PUSH_CONVERSATION=0 strips every question and answer too, so
+    only status, service health and counts leave campus.
+    """
+    snap = snapshot()
+    if os.environ.get("DASHBOARD_PUSH_CONVERSATION", "1") == "0":
+        for t in snap["turns"]:
+            t["question"] = ""
+            t["reply"] = ""
+        snap["conversation_hidden"] = True
+    return snap
+
+
+async def push_remote_forever(interval_s: float = 10.0) -> None:
+    """POST the snapshot to the hosted dashboard, if one is configured.
+
+    The Pi sits behind Morgan's NAT, so a cloud dashboard cannot reach it;
+    the Pi reports out instead. Needs DASHBOARD_REMOTE_URL (the Vercel site)
+    and DASHBOARD_INGEST_SECRET (shared with the site). Failures are logged
+    at most once a minute and never affect the robot.
+    """
+    url = (os.environ.get("DASHBOARD_REMOTE_URL") or "").strip().rstrip("/")
+    secret = (os.environ.get("DASHBOARD_INGEST_SECRET") or "").strip()
+    if not url or not secret:
+        return
+    last_warn = 0.0
+    log = logging.getLogger("sage.dashboard")
+    async with httpx.AsyncClient(timeout=8) as client:
+        while True:
+            try:
+                r = await client.post(
+                    url + "/api/ingest", json=_remote_payload(),
+                    headers={"Authorization": f"Bearer {secret}"})
+                if r.status_code >= 300 and _now() - last_warn > 60:
+                    last_warn = _now()
+                    log.warning("dashboard push got HTTP %s", r.status_code)
+            except Exception as e:  # noqa: BLE001
+                if _now() - last_warn > 60:
+                    last_warn = _now()
+                    log.warning("dashboard push failed: %r", e)
+            await asyncio.sleep(interval_s)
+
+
 # ──────────────────────────────── snapshot ────────────────────────────────
 def snapshot() -> dict[str, Any]:
     now = _now()

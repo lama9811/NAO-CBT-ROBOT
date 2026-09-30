@@ -138,3 +138,43 @@ def test_hook_is_live_under_the_default_structlog_chain():
              active_agent="cs_direct", reply_preview="Jin Guo.")
     assert d.snapshot()["turns"][0]["question"] == "Who teaches COSC 220?"
     structlog.reset_defaults()
+
+
+# ───────────────────────── hosted (Vercel) copy ──────────────────────────
+def test_remote_payload_never_carries_support_words():
+    _turn("therapist", "private words", "private reply")
+    _turn("cs_direct", "Who teaches COSC 220?", "Jin Guo.")
+    turns = d._remote_payload()["turns"]
+    private = [t for t in turns if t["private"]]
+    assert private and all(t["question"] == "" and t["reply"] == "" for t in private)
+    assert any(t["question"] == "Who teaches COSC 220?" for t in turns)
+
+
+def test_status_only_mode_strips_all_words(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PUSH_CONVERSATION", "0")
+    _turn("cs_direct", "Who teaches COSC 220?", "Jin Guo.")
+    p = d._remote_payload()
+    assert p["conversation_hidden"] is True
+    assert all(t["question"] == "" and t["reply"] == "" for t in p["turns"])
+
+
+def test_push_is_off_until_configured(monkeypatch):
+    import asyncio
+    monkeypatch.delenv("DASHBOARD_REMOTE_URL", raising=False)
+    monkeypatch.delenv("DASHBOARD_INGEST_SECRET", raising=False)
+    # Returns immediately instead of looping forever.
+    asyncio.run(asyncio.wait_for(d.push_remote_forever(), 1.0))
+
+
+def test_vercel_copy_matches_the_pi_page():
+    """vercel-dashboard/ serves copies; a drift would ship two different UIs."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    for name in ("index.html", "nao.jpg"):
+        assert (root / "server/dashboard_static" / name).read_bytes() == \
+            (root / "vercel-dashboard" / name).read_bytes(), name
+
+
+def test_page_picks_its_api_by_location():
+    page = (d._STATIC / "index.html").read_text()
+    assert 'ON_PI ? "/dashboard/api" : "/api"' in page
