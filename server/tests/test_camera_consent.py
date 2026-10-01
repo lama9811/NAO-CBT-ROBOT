@@ -228,7 +228,6 @@ def test_first_turn_announce_text_is_expected_string():
             "(owned by sibling Phase 6 camera-consent agent)"
         )
 
-    # Reworded 2026-09-30: the old "Say 'stop watching me' anytime" was
-    # itself a camera-off command, and NAO hears its own speaker.
-    expected = "Heads up, my camera is on for this conversation."
-    assert config.CAMERA_ANNOUNCE_TEXT == expected
+    # Silent by default since 2026-10-01: NAO opens with its "ready to
+    # chat" greeting instead of a camera heads-up.
+    assert config.CAMERA_ANNOUNCE_TEXT == ""

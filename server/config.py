@@ -234,10 +234,9 @@ CAMERA_DEFAULT_ON = os.environ.get("CAMERA_DEFAULT_ON", "1") == "1"
 
 # First-turn audible heads-up emitted by the WS server when a brand-new
 # session opens with `camera_consent=1`. Plain text — TTS-only, no SSML.
-CAMERA_ANNOUNCE_TEXT = os.environ.get(
-    "CAMERA_ANNOUNCE_TEXT",
-    # Must NOT contain a camera-off trigger phrase (motion_trigger.py): NAO
-    # hears its own speaker, and the old wording "Say 'stop watching me'
-    # anytime" made NAO switch its own camera off by hearing itself.
-    "Heads up, my camera is on for this conversation.",
-)
+# Empty = say nothing (the default since 2026-10-01, at the user's request:
+# NAO's first words should be its "ready to chat" greeting). If you set it,
+# it must NOT contain a camera-off trigger phrase (motion_trigger.py): NAO
+# hears its own speaker, and the old wording "Say 'stop watching me'
+# anytime" made NAO switch its own camera off by hearing itself.
+CAMERA_ANNOUNCE_TEXT = os.environ.get("CAMERA_ANNOUNCE_TEXT", "")

@@ -2039,11 +2039,11 @@ _ONBOARDING_NAME_PROMPT = "Hi, I'm NAO. What should I call you?"
 # answers -- it does not interrogate the visitor for a name first. Asking
 # first meant anyone who opened with a question got the question ignored
 # and the name prompt repeated at them instead.
-_ONBOARDING_GREETING = "Hi, I'm NAO. How can I help you today?"
+_ONBOARDING_GREETING = "Hi, I'm NAO. I'm ready to chat."
 
-# On wake Nao introduces itself ("Hi, I'm NAO. How can I help you today?")
-# and then just answers -- no name request. On by default since
-# 2026-09-30 at the user's request; the camera heads-up plays first.
+# On wake Nao introduces itself ("Hi, I'm NAO. I'm ready to chat.") and
+# then just answers -- no name request. On by default since 2026-09-30 at
+# the user's request. No camera heads-up plays before it (2026-10-01).
 # Set WAKE_GREETING=0 to wake silently.
 _WAKE_GREETING = os.environ.get("WAKE_GREETING", "1") == "1"
 

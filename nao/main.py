@@ -131,7 +131,7 @@ def _set_volume(ip, port, level=100):
 # "Hello, I'm NAO." at the room is worse than one that stays quiet.
 _boot_greeting_done = False
 
-_BOOT_GREETING_DEFAULT = "Hello, I'm NAO. How can I help you?"
+_BOOT_GREETING_DEFAULT = "Hi, I'm NAO. I'm ready to chat."
 # Loud enough to carry across a room without clipping the small speaker.
 _BOOT_GREETING_VOLUME = 0.9
 
@@ -256,8 +256,8 @@ def _schedule_boot_engage(wsm, log):
     Face wake rarely fired in practice (2 of 8 wakes on 2026-09-30; the
     rest needed a head tap), and a session stays open once engaged, so
     users were tapping NAO after every start. Engaging at boot makes NAO's
-    first words the camera line and "Hi, I'm NAO. How can I help you
-    today?" -- the "ready to chat" signal -- in its normal voice.
+    first words "Hi, I'm NAO. I'm ready to chat." -- the "ready to chat"
+    signal -- in its normal voice.
     AUTO_ENGAGE_ON_BOOT=0 restores tap/face-only wake. Latched so the
     crash-retry loop does not re-engage.
     """
@@ -675,12 +675,15 @@ class _SessionController(object):
         """Sit NAO down after ``IDLE_SIT_S`` of silence; stand on new talk.
 
         "Activity" is a real transcript or NAO replying (ws_client's
-        ``last_activity_ts``). IDLE_SIT_S=0 disables sitting.
+        ``last_activity_ts``). Off by default since 2026-10-01: NAO sat
+        down after 90 s of quiet and stood back up on the next sound, so
+        it kept sitting and standing on its own mid-visit. Set IDLE_SIT_S
+        to a number of seconds to bring it back (it saves battery).
         """
         try:
-            idle_s = float(os.environ.get("IDLE_SIT_S", "90"))
+            idle_s = float(os.environ.get("IDLE_SIT_S", "0"))
         except ValueError:
-            idle_s = 90.0
+            idle_s = 0.0
         if idle_s <= 0 or not _HAS_NAOQI:
             return
         stop = threading.Event()

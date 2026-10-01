@@ -2,7 +2,7 @@
 
 On 2026-09-30 only 2 of 8 wakes came from a face; the rest needed a head
 tap, after every restart. main.py now calls ``force_engage("boot")`` once
-after start-up, so NAO's first words are the camera line and greeting.
+after start-up, so NAO's first words are its "ready to chat" greeting.
 """
 import sys
 import types

@@ -428,8 +428,8 @@ def test_ws_camera_announce_first_turn_for_consenting_user(monkeypatch,
     # is True but tests reset config — pin it explicitly.
     monkeypatch.setattr(app_ws.config, "CAMERA_DEFAULT_ON", True,
                         raising=False)
-    expected_text = str(getattr(app_ws.config, "CAMERA_ANNOUNCE_TEXT",
-                                 "Heads up — my camera is on for this conversation."))
+    # The default is silent; an operator-set line must still be spoken.
+    expected_text = "Heads up, my camera is on for this conversation."
     monkeypatch.setattr(app_ws.config, "CAMERA_ANNOUNCE_TEXT",
                         expected_text, raising=False)
 
