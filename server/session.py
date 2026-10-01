@@ -173,6 +173,21 @@ def live_anonymous_key() -> str | None:
     return None if _GUEST_EPOCH_TOKEN is None else f"guest:{_GUEST_EPOCH_TOKEN}"
 
 
+def therapy_owner(username: str) -> str:
+    """The key therapy data (moods, thought records, recaps, homework) is
+    stored under.
+
+    Named users keep their plain username, so rows written before this
+    helper existed stay theirs. Anonymous users get the same idle-bounded
+    ``guest:<epoch>`` key as their chat history: before 2026-10-01 every
+    stranger's mood and recap was written under one shared "guest" owner
+    and read back to the next stranger.
+    """
+    if is_anonymous(username):
+        return session_key_for(username)
+    return username.strip()
+
+
 def retire_anonymous_epoch() -> None:
     """Close the current anonymous conversation.
 

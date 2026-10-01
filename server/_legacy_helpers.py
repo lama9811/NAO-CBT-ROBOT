@@ -25,6 +25,7 @@ from openai import OpenAI
 
 from server import config, memory, semantic_endpoint, session, vad_silero
 from server.agents import pick_initial_agent
+from server import conversation_state
 from server.topologies import run_topology
 
 _client = OpenAI(api_key=config.OPENAI_API_KEY)
@@ -780,6 +781,10 @@ async def run_agent_streamed(
     sess = session.get_or_create_session(username)
     ctx = {
         "username": username,
+        # Same dict every turn of this conversation (CBT step, lane...).
+        "conv": conversation_state.state_for(username),
+        # Key therapy rows are written under; per-visit for anonymous users.
+        "owner": session.therapy_owner(username),
         "actions_queue": [],
         "emotion_log": [],
         "latest_image_b64": image_b64,
@@ -923,6 +928,10 @@ def run_agent(username: str, hint: str | None, transcript: str,
     sess = session.get_or_create_session(username)
     ctx = {
         "username": username,
+        # Same dict every turn of this conversation (CBT step, lane...).
+        "conv": conversation_state.state_for(username),
+        # Key therapy rows are written under; per-visit for anonymous users.
+        "owner": session.therapy_owner(username),
         "actions_queue": [],
         "emotion_log": [],
         "latest_image_b64": image_b64,
