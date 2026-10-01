@@ -799,6 +799,14 @@ the robot's face DB *and* upserts the `users` row (`_emit_motion` →
 
 ## Debugging the robot
 
+- **If the Pi *and* the robot both time out, check your own network first.**
+  Run `ipconfig getifaddr en0`. Morgan's network is `172.20.95.x`; anything
+  else (e.g. `10.0.0.x` at home) means *you* are off campus and nothing on
+  `172.20.95.x` is reachable, even though both machines are fine. This looked
+  like a Pi outage on 2026-09-30. Pushes still deploy: the Pi pulls from
+  GitHub on its own, so only SSH and the on-campus dashboard need you on
+  Morgan's network.
+
 - **Beeping every few seconds = low battery, not a bug.** At about 15-20%
   NAOqi's system notification 801 ("My battery will soon need charging")
   flaps on and off; each time it plays a chime and tries to speak. Our code
