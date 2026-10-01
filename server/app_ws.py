@@ -45,6 +45,14 @@ from fastapi import (
 )
 
 from server import breathing_pacing, config, memory, motion_trigger, mute_words, openai_tts, safety
+
+# Apply the tracing switch (see config.OPENAI_AGENTS_TRACE). Without this
+# the Agents SDK uploads every turn's trace to OpenAI.
+try:
+    from agents import set_tracing_disabled as _set_tracing_disabled
+    _set_tracing_disabled(not config.OPENAI_AGENTS_TRACE)
+except Exception:  # noqa: BLE001 -- never block startup over telemetry
+    pass
 from server import _legacy_helpers as legacy
 from server._legacy_helpers import (  # noqa: E402
     _ECHO_MIN_CONTAIN_TOKENS,

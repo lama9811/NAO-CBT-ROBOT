@@ -152,7 +152,10 @@ Server (Python 3.11+) — everything under server/
 
 ## Obsidian Vault
 
-Knowledge vault for this codebase at `~/Documents/Obsidian Vault/Nao-OpenAI-Morgan-Assist/wiki/`. Read `wiki/index.md` first for context. Pattern: `raw/` (immutable) + `wiki/` (LLM-maintained).
+Planned knowledge vault at `~/Documents/Obsidian Vault/Nao-OpenAI-Morgan-Assist/wiki/`
+(pattern: `raw/` immutable + `wiki/` LLM-maintained). **It does not exist yet**
+— as of 2026-09-30 the vault on the Mac holds only Obsidian's `Welcome.md`.
+This file and `README.md` are the current documentation.
 
 ## NAO Robot — Connection
 
@@ -589,10 +592,12 @@ are also permission-scoped: a key without `voices_read` **cannot list voices**
 (401), so you cannot discover an ID from the API — the working IDs are recorded
 in `.env`, and losing them means losing the voice.
 
-**Tracing:** `OPENAI_AGENTS_TRACE` is read into `config.py` and then used by
-nothing, so it does not control anything (removed from the Mac `.env`
-2026-09-30). The Agents SDK uploads traces to OpenAI by default; the switch
-that actually turns that off is `OPENAI_AGENTS_DISABLE_TRACING=1`.
+**Tracing is off by default (since 2026-09-30).** The Agents SDK uploads every
+turn's trace to OpenAI unless told not to, and until this date
+`OPENAI_AGENTS_TRACE` was read by nothing, so tracing was always on even
+though the brain runs on Claude. `app_ws` now calls
+`set_tracing_disabled(not config.OPENAI_AGENTS_TRACE)` at import and the flag
+defaults to `0`; set `OPENAI_AGENTS_TRACE=1` to turn tracing back on.
 
 **2026-09-30: the Claude key died and NAO went silent.** From 14:18 every
 reply failed with `AuthenticationError ... API key is invalid` while Deepgram

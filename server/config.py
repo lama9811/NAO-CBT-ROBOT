@@ -131,8 +131,12 @@ PROACTIVE_GREET_ENABLED = os.environ.get("PROACTIVE_GREET_ENABLED", "0") == "1"
 # Persistence
 SESSION_DB = os.environ.get("SESSION_DB", "server/nao.db")
 
-# Tracing (SDK reads OPENAI_AGENTS_DISABLE_TRACING; we keep it on by default)
-OPENAI_AGENTS_TRACE = os.environ.get("OPENAI_AGENTS_TRACE", "1") == "1"
+# Agents SDK tracing uploads every turn's trace to OpenAI. Off by default
+# since 2026-09-30: the brain runs on Claude, and with a dead OpenAI key each
+# upload was a wasted, failing round-trip. app_ws applies this at startup
+# (before 2026-09-30 nothing read this flag and tracing was always on).
+# OPENAI_AGENTS_TRACE=1 turns it back on.
+OPENAI_AGENTS_TRACE = os.environ.get("OPENAI_AGENTS_TRACE", "0") == "1"
 
 # ───────── SAGE-CBT research layer ─────────
 # Topology dispatcher. "passthrough" = existing router behavior, unchanged.

@@ -51,7 +51,7 @@ sequenceDiagram
     U->>N: speech
     N->>S: WS audio_chunk frames
     S->>S: VAD plus Silero gate
-    S->>S: STT (Deepgram or Whisper)
+    S->>S: STT (Deepgram nova-3, nova-2 retry)
     S-->>S: Crisis gate (988 hard)
     S-->>S: Motion trigger short-circuit
     S->>A: Router to specialist
@@ -103,7 +103,7 @@ graph LR
         CHATBOT["Chatbot"]:::ai
         SKILLS["Skills"]:::ai
         THER["Therapist plus CBT, Grounding, MI"]:::ai
-        VIS["GPT-4o vision<br/>lazy, fresh per question"]:::ai
+        VIS["Claude vision<br/>lazy, fresh per question"]:::ai
         SES[("SQLite session<br/>plus user_prefs")]:::db
         OBS["metrics plus JSONL"]:::srv
     end
@@ -152,36 +152,49 @@ graph TD
     CG -- positive --> H["988 hotline<br/>fixed reply, no LLM"]:::gate
     CG -- clean --> MT{motion trigger}:::route
     MT -- match --> ACT["short-circuit action"]:::route
-    MT -- no match --> R["router<br/>gpt-4.1-nano"]:::route
+    MT -- no match --> CSD{obvious CS question?}:::route
+    CSD -- yes --> CSDIR["straight to CS Navigator<br/>no model call"]:::route
+    CSD -- no --> R["router<br/>Claude Haiku 4.5"]:::route
 
     R --> CH["chat<br/>pure and embodied"]:::spec
     R --> CB["chatbot"]:::spec
     R --> SK["skills"]:::spec
-    R --> TH["therapist<br/>gpt-4.1-mini"]:::spec
+    R --> TH["therapist<br/>Claude Sonnet 5"]:::spec
 
     TH --> CBT["cbt_coach<br/>thought records"]:::sub
     TH --> GR["grounding_coach<br/>5-4-3-2-1, box, scan"]:::sub
     TH -. opt .-> MI["mi_coach<br/>OARS"]:::sub
 
     CH & TH -.-> NA[("nao_actions")]:::tool
-    CB -.-> CSN[("cs_navigator")]:::tool
+    CB & CH & SK & TH -.-> CSN[("cs_navigator")]:::tool
     SK -.-> ST[("skills_tools")]:::tool
     TH & CBT & GR -.-> EM[("emotion plus memory")]:::tool
     CH -.-> LF[("learn_face")]:::tool
 ```
 
-| Agent | Role | Default model |
+Models as deployed (September 2026). Any `*_MODEL` setting can name a Claude
+or an OpenAI model; the code defaults are still OpenAI ids, the live `.env`
+files point at Claude.
+
+| Agent | Role | Live model |
 |---|---|---|
-| **router** | triage + handoff (sensory grounding rule, never denies senses) | `gpt-4.1-nano` |
-| **chat (pure)** | tool‑less ultra‑fast lane, &lt; 2 s first audio | `gpt-4.1-nano` |
-| **chat (embodied)** | gestures + actions + face learn | `gpt-4.1-nano` |
-| **chatbot** | Morgan‑CS RAG via CS Navigator API | `gpt-4.1-mini` |
-| **skills** | time, weather, timers, todos | `gpt-4.1-nano` |
-| **therapist** | empathy + handoffs + vision | `gpt-4.1-mini` |
-| **cbt_coach** | Beck thought record (one step per turn) | `gpt-4.1-mini` |
-| **grounding_coach** | 5‑4‑3‑2‑1, box breathing, body scan | `gpt-4.1-mini` |
-| **mi_coach** | Motivational Interviewing (OARS) — experimental | `gpt-4.1-mini` |
-| **crisis** | safety classifier (soft triggers only) | `gpt-4.1` |
+| **router** | triage + handoff (sensory grounding rule, never denies senses) | Claude Haiku 4.5 |
+| **chat (pure)** | fast everyday lane; only tool is CS Navigator | Claude Haiku 4.5 |
+| **chat (embodied)** | gestures + actions + face learn | Claude Haiku 4.5 |
+| **chatbot** | Morgan CS answers via CS Navigator | Claude Sonnet 5 |
+| **skills** | time, weather, timers, todos | Claude Haiku 4.5 |
+| **therapist** | empathy + handoffs | Claude Sonnet 5 |
+| **cbt_coach** | Beck thought record (one step per turn) | Claude Sonnet 5 |
+| **grounding_coach** | 5‑4‑3‑2‑1, box breathing, body scan | Claude Sonnet 5 |
+| **mi_coach** | Motivational Interviewing (OARS) — experimental | Claude Sonnet 5 |
+| **crisis** | safety classifier, CBT distortion check, memory rollups | Claude Opus 5 |
+| **vision** | camera read, lazy, per question | Claude Sonnet 5 |
+
+Every agent that answers users carries one shared rule
+(`server/agents/_cs_rule.py`): Morgan State CS questions are answered from CS
+Navigator, never from the model's memory. Obvious CS questions (a course code
+like "COSC 220", "who teaches", "prerequisite") skip the models entirely and
+go straight to CS Navigator.
 
 ---
 
@@ -428,6 +441,32 @@ The robot's `~/.bash_profile` previously auto‑started a separate Feb‑2026 pr
 
 ---
 
+## Recent changes (September 2026)
+
+- **Looks at whoever is talking** (`nao/awareness.py`): the head turns toward a
+  voice, holds there, and the face tracker locks on; sounds from behind NAO
+  are ignored and it recentres when nobody is found. Sound direction is now
+  parsed with the NAOqi 2.8 layout (it read as 0° before).
+- **Autonomous Life stays off**: it re-enabled itself after boot and locked
+  the head on one person; a guard now keeps it disabled.
+- **A new person is a new person**: after each turn toward a voice NAO
+  re-checks the face; weak matches (< 0.75) count as unknown, so a stranger is
+  no longer called by the previous person's name.
+- **Starts on its own**: a few seconds after power-up NAO says "Heads up, my
+  camera is on for this conversation." and "Hi, I'm NAO. How can I help you
+  today?" No tap needed. Stands while chatting, sits after 90 s of quiet.
+- **Faster CS answers**: obvious CS questions go straight to CS Navigator
+  with a "Let me check that." filler (answer in ~4.5–7 s, was 10–15 s).
+- **Camera off is real**: "stop watching me" persists and stops photos; NAO no
+  longer turns its own camera off by hearing its announcement.
+- **Mute replies**: "Okay, my lips are closed now." / "I'm back."
+- **One voice**: ElevenLabs only; the OpenAI backup voice is removed. OpenAI
+  tracing is off.
+- **Live dashboard**: `http://<pi-ip>:5050/dashboard` (no login) shows robot
+  and Pi status, battery, a live check of every outside service, and the
+  conversation (support conversations hidden). A hosted copy can run on
+  Vercel from `vercel-dashboard/`.
+
 ## Recent changes (May 2026)
 
 - **Pi migration**: server now runs on a Raspberry Pi 4 via systemd; robot autostarts via Choregraphe default behavior. The robot can be unboxed, powered on, and talked to without any laptop.
@@ -446,18 +485,22 @@ The robot's `~/.bash_profile` previously auto‑started a separate Feb‑2026 pr
 
 | Say | Triggers |
 |---|---|
-| "Hey NAO" / step into view | Wake state machine |
+| (nothing, it greets you on power-up) | Boot engage: camera line + "Hi, I'm NAO. How can I help you today?" |
+| Step into view / touch the head | Wake state machine (there is no voice wake word) |
 | "Wave at my friend" | `wave_hand` action |
 | "Do the kung fu" | `dance(style='kungfu')` -> `KungFu_1` Choregraphe pack |
 | "Follow me" / "Track me" | `follow_movement` (`follow-me` pack) |
 | "Stop following me" / "Freeze" | `stop_follow` |
-| "What am I wearing?" / "Can you see me?" | Lazy GPT‑4o vision call |
+| "What am I wearing?" / "Can you see me?" | Lazy vision call (Claude Sonnet 5) |
 | "Switch to a man voice" / "Use my voice" | Voice profile flip (per‑user persisted) |
 | "Remember me as Aayush" | `learn_face(name='Aayush')` |
-| "Stop watching me" | Camera off for session |
+| "Stop watching me" / "You can watch me again" | Camera off / on, remembered per person |
+| "Be quiet" / "Mute" | "Okay, my lips are closed now." then silent |
+| "You can talk" / "Unmute" | "I'm back." |
 | "Set a 10‑minute timer" | Skills agent |
 | "I'm anxious about finals" | Therapist agent |
 | "What classes does Morgan offer in spring?" | CS Navigator (chatbot agent) |
+| "Who teaches COSC 220?" | CS Navigator directly, no model call |
 
 Tap NAO's head sensors at any time to **barge in** — TTS stops within ~200 ms, current behavior cancels via `stopAllBehaviors()`.
 
@@ -487,7 +530,8 @@ nao-sagecbt/
 │   ├── audio_module.py       ALAudioRecorder fragment streamer
 │   ├── stream_tts.py         MP3 -> WAV -> ALAudioPlayer + ffmpeg loudness
 │   ├── wake_state.py         IDLE -> AWARE -> ENGAGED -> LISTENING -> SPEAKING
-│   ├── sound_localize.py     ALSoundLocalization auto-track
+│   ├── awareness.py          Look at the speaker, keep Autonomous Life off
+│   ├── sound_localize.py     ALSoundLocalization (legacy head path)
 │   ├── leds.py               eye LED helpers
 │   ├── idle_motion.py        background breathing + gaze drift
 │   └── utils/
