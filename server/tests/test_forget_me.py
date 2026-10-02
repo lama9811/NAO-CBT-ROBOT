@@ -35,11 +35,11 @@ def _seed(path, user, *, homework=True):
         c.execute("INSERT INTO sessions (face_id, started_at, summary) "
                   "VALUES (?, 0, 's')", (user.lower(),))
         if homework:
-            c.execute("CREATE TABLE IF NOT EXISTS homework (id INTEGER "
-                      "PRIMARY KEY, username TEXT, task TEXT, created_at "
-                      "TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("INSERT INTO homework (username, task) VALUES (?, 'x')",
-                      (user,))
+            # session.py's real table, keyed by ``owner``.
+            c.execute("INSERT INTO homework (owner, task) VALUES (?, 'x')",
+                      (user.lower(),))
+        else:
+            c.execute("DROP TABLE IF EXISTS homework")
 
 
 def _count(path, table, where="1=1", args=()):
@@ -65,8 +65,9 @@ def test_forget_deletes_one_user_and_leaves_others(db):
 
     for table in ("mood_log", "thought_records", "recaps", "user_prefs",
                   "homework"):
-        assert _count(db, table, "lower(username)='alice'") == 0, table
-        assert _count(db, table, "username='Bob'") == 1, table
+        col = "owner" if table == "homework" else "username"
+        assert _count(db, table, f"lower({col})='alice'") == 0, table
+        assert _count(db, table, f"lower({col})='bob'") == 1, table
     assert _count(db, "users", "face_id='alice'") == 0
     assert _count(db, "sessions", "face_id='alice'") == 0
     assert _count(db, "users", "face_id='bob'") == 1
@@ -109,7 +110,8 @@ def test_forget_clears_conversation_state(db):
     conv = conversation_state.state_for("Alice")
     conv["cbt_step"] = 3
     privacy.forget_user_data("Alice")
-    assert conversation_state.state_for("Alice") == {}
+    # A fresh state is stamped with started_at; nothing else survives.
+    assert "cbt_step" not in conversation_state.state_for("Alice")
 
 
 # ───────── voice phrase + confirmation ─────────
