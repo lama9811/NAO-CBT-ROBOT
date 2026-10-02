@@ -331,6 +331,20 @@ class NaoWsClient(object):
         self._speaking_gesture_suppress_lock = threading.Lock()
         self._stood_up_once = False
 
+        # Turn-taking eye colours, driven by the server's `turn_state` and
+        # `led_breath` controls. ``leds`` is a ``leds.LedDriver`` that
+        # main.py attaches after construction; None means no LED cues.
+        # `_turn_leds_seen` stays False until the server sends its first
+        # `turn_state`, so against an older server the eyes behave exactly
+        # as before.
+        self.leds = None
+        self._turn_leds_enabled = os.environ.get("TURN_LEDS", "1") == "1"
+        self._turn_leds_seen = False
+        self._turn_state_gen = 0
+        self._turn_state_lock = threading.Lock()
+        # seq of an upcoming audio_chunk -> (phase, seconds) breathing cue.
+        self._pending_breath = {}
+
     # ------------------------------------------------------------------
     # External: queue a control frame from anywhere on the robot side
     # (e.g. audio_module pushing wake_event, end_of_utterance from the
@@ -555,9 +569,21 @@ class NaoWsClient(object):
             self._start_speaking_gestures()
         except Exception:
             pass
+        on_start = self._breath_on_start(frame)
         try:
-            self.tts_player.enqueue(text, mp3_bytes,
-                                    pause_after_ms=pause_after_ms)
+            if on_start is not None:
+                try:
+                    self.tts_player.enqueue(text, mp3_bytes,
+                                            pause_after_ms=pause_after_ms,
+                                            on_start=on_start)
+                except TypeError:
+                    # A player without on_start: fade on receipt instead.
+                    on_start()
+                    self.tts_player.enqueue(text, mp3_bytes,
+                                            pause_after_ms=pause_after_ms)
+            else:
+                self.tts_player.enqueue(text, mp3_bytes,
+                                        pause_after_ms=pause_after_ms)
         except Exception as exc:
             print("[tts_trace] tts_player.enqueue raised: {0}: {1}".format(
                 type(exc).__name__, exc))
@@ -820,6 +846,14 @@ class NaoWsClient(object):
                     self.log.debug("announcer_start_failed", error=str(exc))
         elif sub == "echo_reject":
             self._on_echo_reject(data)
+        elif sub == "turn_state":
+            self._on_turn_state(data)
+        elif sub == "led_breath":
+            self._on_led_breath(data)
+        elif sub == "conversation_closed":
+            # Goodbye: the server closed the conversation. The robot stays
+            # engaged (the wake state machine ends the session as usual).
+            self.log.info("conversation_closed", reason=data.get("reason"))
         elif sub == "session_end":
             self.log.info("server_session_end", reason=data.get("reason"))
         elif sub == "agent_handoff":
@@ -828,6 +862,99 @@ class NaoWsClient(object):
                                               if k in data})
         else:
             self.log.warn("control_subtype_unknown", subtype=sub)
+
+    # --- Turn-taking eye colours ---------------------------------------
+    def _led_call(self, method_name, *args):
+        """Call ``self.leds.<method_name>(*args)``; never raise."""
+        leds = self.leds
+        if leds is None or not self._turn_leds_enabled:
+            return False
+        method = getattr(leds, method_name, None)
+        if method is None:
+            return False
+        try:
+            method(*args)
+            return True
+        except Exception as exc:
+            self.log.debug("turn_led_failed", method=method_name,
+                           error=str(exc))
+            return False
+
+    def _on_turn_state(self, data):
+        """listening = cyan, thinking = pulsing blue, speaking = yellow.
+
+        "listening" is applied only once local playback has drained:
+        the server sends it as soon as it has finished *sending* audio,
+        which can be seconds before NAO finishes *playing* it.
+        """
+        state = str(data.get("state") or "")
+        self._turn_leds_seen = True
+        with self._turn_state_lock:
+            self._turn_state_gen += 1
+            gen = self._turn_state_gen
+        if state == "thinking":
+            self._led_call("set_thinking")
+        elif state == "speaking":
+            self._led_call("set_speaking")
+        elif state == "listening":
+            self._set_listening_after_playback(gen)
+        else:
+            self.log.debug("turn_state_unknown", state=state)
+
+    def _set_listening_after_playback(self, gen=None):
+        if self.leds is None or not self._turn_leds_enabled:
+            return
+
+        def _wait_then_listen():
+            t0 = time.time()
+            while time.time() - t0 < 30.0:
+                if gen is not None and gen != self._turn_state_gen:
+                    return  # a newer turn_state superseded this one
+                try:
+                    playing = bool(self.tts_player.is_playing()) \
+                        if self.tts_player is not None else False
+                except Exception:
+                    playing = False
+                if not playing:
+                    break
+                time.sleep(0.1)
+            if gen is not None and gen != self._turn_state_gen:
+                return
+            self._led_call("set_listening")
+
+        t = threading.Thread(target=_wait_then_listen,
+                             name="nao-turn-led-listen")
+        t.daemon = True
+        t.start()
+
+    def _on_led_breath(self, data):
+        """Remember a breathing cue for the audio chunk it belongs to.
+
+        The fade starts when that chunk starts playing (see
+        ``_handle_audio_chunk``), not now -- earlier chunks may still be
+        queued ahead of it. A cue without a seq is applied at once.
+        """
+        phase = data.get("phase")
+        seconds = data.get("seconds")
+        seq = data.get("seq")
+        if seq is None:
+            self._led_call("breathe", phase, seconds)
+            return
+        # Keep the map small even if chunks never arrive (TTS failure).
+        if len(self._pending_breath) > 64:
+            self._pending_breath.clear()
+        self._pending_breath[seq] = (phase, seconds)
+
+    def _breath_on_start(self, frame):
+        """Playback-start callback for the chunk's breathing cue, or None."""
+        cue = self._pending_breath.pop(frame.get("seq"), None)
+        if cue is None:
+            return None
+        phase, seconds = cue
+
+        def _start():
+            self._led_call("breathe", phase, seconds)
+        return _start
 
     # --- Phase 7: brain_sync push handler -----------------------------
     def _handle_brain_sync(self, data):
@@ -1131,6 +1258,10 @@ class NaoWsClient(object):
                               grace_ms=int(grace_s * 1000))
             except Exception as exc:
                 self.log.error("mic_gate_open_failed", error=str(exc))
+            # Mic is open again: eyes to listening (only once the server
+            # has shown it drives turn LEDs; older servers never do).
+            if self._turn_leds_seen:
+                self._led_call("set_listening")
 
         t = threading.Thread(target=_waiter, name="nao-mic-resume-waiter")
         t.daemon = True

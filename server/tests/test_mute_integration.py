@@ -98,7 +98,10 @@ class TestSuppression:
         ws, sess = FakeWS(), _session()
         sent = asyncio.run(app_ws._send_audio_chunk(ws, sess, _mp3_frame()))
         assert sent is True
-        assert len(ws.sent) == 1
+        # One audio frame (plus the `turn_state: speaking` eye cue).
+        audio = [f for f in ws.sent
+                 if isinstance(f, dict) and f.get("type") == "audio_chunk"]
+        assert len(audio) == 1
 
     def test_audio_suppressed_when_muted(self):
         ws, sess = FakeWS(), _session()

@@ -335,8 +335,12 @@ class StreamTtsPlayer(object):
             if self._pending_jobs > 0:
                 self._pending_jobs -= 1
 
-    def enqueue(self, text, mp3_bytes, pause_after_ms=0):
+    def enqueue(self, text, mp3_bytes, pause_after_ms=0, on_start=None):
         """Accept one TTS chunk; non-blocking; queues for playback.
+
+        ``on_start`` is an optional no-argument callable run on the worker
+        thread just before this chunk starts playing (used to start an
+        eye-LED breathing fade in time with a paced breathing count).
 
         Pins the volume BEFORE the worker dequeues, not just inside the
         worker, because the previous turn's interrupt may have left the
@@ -397,7 +401,7 @@ class StreamTtsPlayer(object):
             preview = preview[:60]
         except Exception:
             preview = ""
-        self._queue.put((path, text, pause_after_ms))
+        self._queue.put((path, text, pause_after_ms, on_start))
         print("[stream_tts] enqueue:", preview,
               "(", len(mp3_bytes), "bytes ->", path, ")")
 
@@ -500,12 +504,15 @@ class StreamTtsPlayer(object):
             if job is None:
                 # Shutdown sentinel.
                 break
+            on_start = None
             try:
                 if len(job) >= 3:
                     path, _text, pause_after_ms = job[:3]
                 else:
                     path, _text = job
                     pause_after_ms = 0
+                if len(job) >= 4:
+                    on_start = job[3]
             except Exception:
                 self._dec_pending_job()
                 continue
@@ -525,6 +532,11 @@ class StreamTtsPlayer(object):
             with self._state_lock:
                 self._playing = True
             self._play_abort_event.clear()
+            if on_start is not None:
+                try:
+                    on_start()
+                except Exception as exc:
+                    print("[stream_tts] on_start callback failed: {0}".format(exc))
             try:
                 self._play_one(path, pause_after_ms=pause_after_ms)
             finally:

@@ -137,6 +137,72 @@ def _expand_count_text(text: str) -> list[tuple[str, int]]:
     return [(segment, pause) for segment, pause in out if segment]
 
 
+# ───────── breathing phases → eye LEDs ─────────
+#
+# A paced breathing script is a run of small chunks ("Breathe in slowly:
+# one", "two", ..., "and hold."). Each phase cue opens a phase that lasts
+# until the next cue; the robot fades its eyes up on inhale, holds, and
+# fades down on exhale, so the student can follow the light as well as the
+# voice.
+
+_PHASE_RE = re.compile(
+    r"\b(?P<inhale>breathe in|breath in|inhale|inhaling|in through)\b"
+    r"|\b(?P<exhale>breathe out|breath out|exhale|exhaling|out through|"
+    r"let it out|let it go|release)\b"
+    r"|\b(?P<hold>hold|holding|pause)\b",
+    re.IGNORECASE,
+)
+# Rough time to say one short chunk ("two", "and hold") before its pause.
+SPOKEN_CHUNK_S = 0.35
+MIN_PHASE_S = 1.0
+MAX_PHASE_S = 10.0
+
+
+def _chunk_phase(text: str) -> str | None:
+    """The breathing phase a chunk announces, if any (last cue wins)."""
+    last = None
+    for m in _PHASE_RE.finditer(text or ""):
+        last = m.lastgroup
+    return last
+
+
+def breath_phase_cues(chunks: list[tuple[str, int]]) -> list[dict | None]:
+    """Per-chunk LED cue for a paced breathing sentence.
+
+    Returns a list the same length as ``chunks``: ``None`` for a chunk that
+    starts no phase, or ``{"phase": "inhale"|"hold"|"exhale",
+    "seconds": float}`` for the chunk where a phase begins. ``seconds``
+    covers that chunk and every following chunk up to the next cue --
+    speech plus the enforced pauses -- so the fade lasts as long as the
+    count does.
+
+    Only fires for sentences the pacing actually expanded (more than one
+    chunk, or a pause): ordinary talk that merely mentions "hold" never
+    drives the eyes.
+    """
+    cues: list[dict | None] = [None] * len(chunks)
+    if not chunks:
+        return cues
+    if len(chunks) == 1 and int(chunks[0][1] or 0) <= 0:
+        return cues
+    starts = [(i, _chunk_phase(text)) for i, (text, _p) in enumerate(chunks)]
+    starts = [(i, ph) for i, ph in starts if ph]
+    for n, (i, phase) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else len(chunks)
+        seconds = sum(
+            SPOKEN_CHUNK_S + max(0, int(chunks[j][1] or 0)) / 1000.0
+            for j in range(i, end)
+        )
+        seconds = max(MIN_PHASE_S, min(MAX_PHASE_S, seconds))
+        cues[i] = {"phase": phase, "seconds": round(seconds, 1)}
+    return cues
+
+
+def is_paced(chunks: list[tuple[str, int]]) -> bool:
+    """True when ``expand_tts_pacing`` turned a sentence into a paced script."""
+    return len(chunks) > 1 or bool(chunks and int(chunks[0][1] or 0) > 0)
+
+
 def expand_tts_pacing(text: str) -> list[tuple[str, int]]:
     """Return ``(tts_text, pause_after_ms)`` chunks for a sentence.
 
