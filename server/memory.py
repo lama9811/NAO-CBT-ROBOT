@@ -294,6 +294,15 @@ def _therapy_memory_lines(username: str) -> list[str]:
     """
     if not username:
         return []
+    try:
+        from server import session as _ses
+        # Named students only. An anonymous visit's rows live under a
+        # per-visit guest:<epoch> key and are never read back here; the
+        # bare "guest" name must never surface anyone's therapy data.
+        if _ses.is_anonymous(username) or username.startswith("guest:"):
+            return []
+    except Exception:
+        return []
     lines: list[str] = []
     try:
         from server import session as _ses
@@ -322,16 +331,36 @@ def _therapy_memory_lines(username: str) -> list[str]:
         thoughts = _ses.load_recent_thought_records(username, n=2) or []
         for t in thoughts:
             distortion = _scrub(str(t.get("distortion") or ""))[:32]
-            reframe = _scrub(str(t.get("reframe") or ""))[:200]
+            # The student's own balanced thought when the full record was
+            # walked; the legacy reframe column otherwise.
+            reframe = _scrub(str(t.get("balanced_thought")
+                                 or t.get("reframe") or ""))[:200]
             thought = _scrub(str(t.get("thought") or ""))[:160]
+            before = t.get("intensity_before")
+            after = t.get("intensity_after")
+            shift = ""
+            if before is not None and after is not None:
+                shift = " ({0} {1}/10 -> {2}/10)".format(
+                    _scrub(str(t.get("emotion") or "feeling"))[:24],
+                    int(before), int(after))
             if distortion and reframe:
                 lines.append(
-                    "- Last thought record: '{0}' -> {1} -> {2}".format(
-                        thought, distortion, reframe))
+                    "- Last thought record: '{0}' -> {1} -> {2}{3}".format(
+                        thought, distortion, reframe, shift))
             elif distortion:
                 lines.append(
-                    "- Last thought record: '{0}' -> {1}".format(
-                        thought, distortion))
+                    "- Last thought record: '{0}' -> {1}{2}".format(
+                        thought, distortion, shift))
+    except Exception:
+        pass
+
+    try:
+        from server import session as _ses
+        for h in _ses.load_open_homework(username, n=2) or []:
+            due = _scrub(str(h.get("due_hint") or ""))[:40]
+            lines.append("- Open homework: '{0}'{1}".format(
+                _scrub(str(h.get("task") or ""))[:160],
+                " ({0})".format(due) if due else ""))
     except Exception:
         pass
 

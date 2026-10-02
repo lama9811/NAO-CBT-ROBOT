@@ -108,6 +108,27 @@ def _unwrap(ctx) -> dict:
     return ctx.context if isinstance(ctx, RunContextWrapper) else ctx
 
 
+def _owner(store: dict) -> str:
+    """The key this conversation's therapy rows are stored under.
+
+    ``ctx["owner"]`` (``session.therapy_owner``) when the runner set it:
+    the username for a named student, ``guest:<epoch>`` for an anonymous
+    visit. Never the bare "guest" -- that one key pooled every stranger's
+    moods and recaps and read them back to the next stranger.
+    """
+    owner = str(store.get("owner") or "").strip()
+    if owner:
+        return owner
+    return session.therapy_owner(str(store.get("username") or "guest"))
+
+
+def _conv(store: dict) -> dict:
+    """State that survives across turns (``ctx["conv"]``); falls back to the
+    per-turn ctx itself so tools still work when called without it."""
+    conv = store.get("conv")
+    return conv if isinstance(conv, dict) else store
+
+
 # ────────── log_emotion ──────────
 
 def _log_emotion_impl(ctx, mood: str, intensity: int, trigger: str) -> str:
@@ -119,12 +140,11 @@ def _log_emotion_impl(ctx, mood: str, intensity: int, trigger: str) -> str:
     # mood trajectory. In-memory `emotion_log` is still used by the
     # session recap rollup at end-of-conversation.
     try:
-        from server import session as _ses
-        username = (store.get("username") or "").strip()
-        if username:
-            _ses.log_mood(username, mood, int(intensity), trigger)
+        session.log_mood(_owner(store), mood, int(intensity), trigger)
     except Exception:
         pass  # best-effort; never break the agent turn
+    # The therapist's opening mood check is done for this visit.
+    _conv(store)["mood_checked"] = True
     return "logged"
 
 
@@ -171,22 +191,26 @@ def _persist_thought(ctx, thought: str, distortion: str) -> None:
     breaks the agent turn.
     """
     try:
-        from server import session as _ses
         store = _unwrap(ctx)
-        username = (store.get("username") or "").strip()
-        if username:
-            _ses.log_thought_record(username, thought, distortion, reframe="")
+        record_id = session.log_thought_record(
+            _owner(store), thought, distortion, reframe="")
+        # Remember the row so save_full_thought_record completes this one
+        # instead of adding a second row for the same exercise.
+        conv = _conv(store)
+        if record_id:
+            conv["thought_record_id"] = record_id
+        rec = conv.setdefault("cbt_record", {})
+        rec["thought"] = str(thought)[:500]
+        rec["distortion"] = str(distortion)[:64]
     except Exception:
         pass
 
 
 def _persist_reframe(ctx, thought: str, reframe_text: str) -> None:
     try:
-        from server import session as _ses
         store = _unwrap(ctx)
-        username = (store.get("username") or "").strip()
-        if username:
-            _ses.attach_reframe_to_latest_thought(username, thought, reframe_text)
+        session.attach_reframe_to_latest_thought(
+            _owner(store), thought, reframe_text)
     except Exception:
         pass
 
@@ -204,6 +228,12 @@ def _identify_distortion_and_persist(ctx, thought: str) -> dict:
     label = (out.get("distortion") or "").strip()
     if _is_no_distortion(label):
         out["distortion"] = NO_DISTORTION
+        try:
+            rec = _conv(_unwrap(ctx)).setdefault("cbt_record", {})
+            rec["thought"] = str(thought)[:500]
+            rec["distortion"] = NO_DISTORTION
+        except Exception:
+            pass
         return out
     _persist_thought(ctx, thought, label)
     return out
@@ -522,21 +552,261 @@ def set_camera_consent(ctx: RunContextWrapper, enabled: bool) -> str:
     return _set_camera_consent_impl(ctx, enabled)
 
 
-# ────────── recap_session ──────────
+# ────────── full thought record ──────────
+
+_RECORD_FIELDS = (
+    "situation", "emotion", "intensity_before", "thought", "distortion",
+    "evidence_for", "evidence_against", "balanced_thought", "intensity_after",
+)
+
+
+def _rating(value) -> int | None:
+    """A 0-10 rating the student gave, or None (-1 / blank = not given)."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    return None if v < 0 else min(10, v)
+
+
+def _save_full_thought_record_impl(ctx, **fields) -> str:
+    """Write the completed thought record and close the CBT walk.
+
+    Empty arguments fall back to the answers the coach noted along the way
+    (``ctx["conv"]["cbt_record"]``), so a field said three turns ago is not
+    lost because the model left it out of the final call.
+    """
+    store = _unwrap(ctx)
+    conv = _conv(store)
+    noted = conv.get("cbt_record") or {}
+    merged = {}
+    for key in _RECORD_FIELDS:
+        given = fields.get(key)
+        if key.startswith("intensity"):
+            val = _rating(given)
+            merged[key] = val if val is not None else _rating(noted.get(key))
+        else:
+            val = str(given or "").strip()
+            merged[key] = val or str(noted.get(key) or "").strip()
+    if not merged["thought"]:
+        return "not saved: no automatic thought recorded yet"
+    if _is_no_distortion(merged["distortion"]):
+        # A balanced thought is not a distortion record -- see
+        # _identify_distortion_and_persist. Nothing is written.
+        conv["cbt_step"] = "done"
+        conv.pop("cbt_record", None)
+        conv.pop("thought_record_id", None)
+        return "not saved: the thought was balanced (no distortion)"
+    try:
+        record_id = session.save_full_thought_record(
+            _owner(store), record_id=conv.get("thought_record_id"), **merged)
+    except Exception:
+        record_id = None
+    conv["cbt_step"] = "done"
+    conv.pop("cbt_record", None)
+    conv.pop("thought_record_id", None)
+    if not record_id:
+        return "not saved"
+    return f"saved thought record #{record_id}"
+
+
+@function_tool
+def save_full_thought_record(
+    ctx: RunContextWrapper,
+    situation: str = "",
+    emotion: str = "",
+    intensity_before: int = -1,
+    thought: str = "",
+    distortion: str = "",
+    evidence_for: str = "",
+    evidence_against: str = "",
+    balanced_thought: str = "",
+    intensity_after: int = -1,
+) -> str:
+    """Save the finished thought record (call once, after the re-rating).
+
+    Use the student's own words. `balanced_thought` is the one the STUDENT
+    chose or worded, not your suggestion. Intensities are 0-10; pass -1 if
+    the student didn't give one. Blank fields fall back to answers noted
+    earlier with `cbt_note`.
+    """
+    return _save_full_thought_record_impl(
+        ctx, situation=situation, emotion=emotion,
+        intensity_before=intensity_before, thought=thought,
+        distortion=distortion, evidence_for=evidence_for,
+        evidence_against=evidence_against,
+        balanced_thought=balanced_thought, intensity_after=intensity_after,
+    )
+
+
+# ────────── homework ──────────
+
+def _assign_homework_impl(ctx, task: str, due_hint: str = "") -> str:
+    store = _unwrap(ctx)
+    task = (task or "").strip()
+    if not task:
+        return "not saved: empty task"
+    try:
+        hw_id = session.add_homework(_owner(store), task, due_hint)
+    except Exception:
+        hw_id = None
+    if not hw_id:
+        return "not saved"
+    _conv(store)["homework_id"] = hw_id
+    return f"saved homework #{hw_id}"
+
+
+@function_tool
+def assign_homework(ctx: RunContextWrapper, task: str, due_hint: str = "") -> str:
+    """Save ONE small between-session activity the student CHOSE and agreed
+    to (e.g. task="10-minute walk before the 2pm class", due_hint="this
+    week"). Only call after they say yes; never assign it yourself."""
+    return _assign_homework_impl(ctx, task, due_hint)
+
+
+def _review_homework_impl(ctx, status: str, outcome: str = "",
+                          homework_id: int = 0) -> str:
+    store = _unwrap(ctx)
+    try:
+        row = session.review_homework(
+            _owner(store), outcome, status, homework_id=homework_id or None)
+    except Exception:
+        row = None
+    if not row:
+        return "no open homework to review"
+    _conv(store)["homework_reviewed"] = True
+    return "reviewed homework #{0} '{1}': {2}".format(
+        row["id"], row["task"], row["status"])
+
+
+@function_tool
+def review_homework(ctx: RunContextWrapper, status: str, outcome: str = "",
+                    homework_id: int = 0) -> str:
+    """Record how the student's open homework went. status is one of:
+    done, partly, not_done, dropped. outcome is a few of their words about
+    what happened. Not doing it is fine -- stay curious, never judge."""
+    return _review_homework_impl(ctx, status, outcome, homework_id)
+
+
+# ────────── session recap ──────────
+
+_EMPTY_RECAP = "Brief check-in; no notable thoughts logged."
+
+
+def _clip(text, n: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[: n - 3].rstrip() + "..."
+
+
+def build_recap_body(owner: str, since: float | None) -> str:
+    """A recap made from what was actually recorded this visit -- moods,
+    thought records, homework -- rather than from the raw transcript."""
+    parts: list[str] = []
+    moods = list(reversed(session.load_recent_moods(owner, n=5, since=since)))
+    if moods:
+        parts.append("Mood: " + " -> ".join(
+            "{0} {1}/10".format(_clip(m["mood"], 20), m["intensity"])
+            for m in moods) + ".")
+        trigger = _clip(moods[-1].get("trigger"), 80)
+        if trigger:
+            parts.append("About: " + trigger + ".")
+    for t in reversed(session.load_recent_thought_records(owner, n=2,
+                                                          since=since)):
+        line = "Thought record: '{0}'".format(_clip(t.get("thought"), 90))
+        if t.get("distortion"):
+            line += " ({0})".format(_clip(t["distortion"], 30))
+        balanced = t.get("balanced_thought") or t.get("reframe")
+        if balanced:
+            line += "; balanced thought: '{0}'".format(_clip(balanced, 90))
+        before, after = t.get("intensity_before"), t.get("intensity_after")
+        if before is not None and after is not None:
+            line += "; {0} {1} -> {2}/10".format(
+                _clip(t.get("emotion") or "feeling", 20), before, after)
+        parts.append(line + ".")
+    for h in reversed(session.load_homework_since(owner, since, n=3)):
+        if h["status"] == "open":
+            due = " ({0})".format(_clip(h["due_hint"], 30)) if h["due_hint"] else ""
+            parts.append("New homework: '{0}'{1}.".format(
+                _clip(h["task"], 80), due))
+        else:
+            outcome = " - " + _clip(h["outcome"], 60) if h["outcome"] else ""
+            parts.append("Reviewed homework '{0}': {1}{2}.".format(
+                _clip(h["task"], 60), h["status"].replace("_", " "), outcome))
+    if not parts:
+        return _EMPTY_RECAP
+    return _clip(" ".join(parts), 700)
+
+
+def finalize_session_recap(username: str, *, owner: str | None = None,
+                           conv: dict | None = None) -> str:
+    """Write (or rewrite) this visit's recap from its persisted rows.
+
+    Covers rows written since the conversation began
+    (``conv["started_at"]``). A second recap in the same conversation
+    updates the same row (``conv["recap_id"]``) instead of adding another.
+    Returns the recap text.
+    """
+    from server import conversation_state
+    if conv is None:
+        conv = conversation_state.state_for(username)
+    owner = owner or session.therapy_owner(username)
+    body = build_recap_body(owner, conv.get("started_at"))
+    recap_id = conv.get("recap_id")
+    try:
+        if recap_id:
+            session.update_recap(recap_id, body)
+        else:
+            recap_id = session.save_recap(owner, body)
+            if recap_id:
+                conv["recap_id"] = recap_id
+    except Exception:
+        pass
+    conv["therapy_closed"] = True
+    if not session.is_anonymous(username):
+        try:
+            from server import memory_rollup
+            memory_rollup.maybe_rollup_week(owner)
+            memory_rollup.maybe_rollup_month(owner)
+        except Exception:
+            pass
+    return body
+
+
+def _finalize_session_recap_impl(ctx) -> str:
+    store = _unwrap(ctx)
+    username = str(store.get("username") or "guest")
+    conv = store.get("conv") if isinstance(store.get("conv"), dict) else None
+    return finalize_session_recap(username, owner=_owner(store), conv=conv)
+
+
+@function_tool(name_override="finalize_session_recap")
+def finalize_session_recap_tool(ctx: RunContextWrapper) -> str:
+    """Save a short recap of this visit (moods, thought records, homework).
+    Call once at the close, after any homework is agreed. Safe to call
+    again; it rewrites the same recap."""
+    return _finalize_session_recap_impl(ctx)
+
 
 def _recap_session_impl(ctx) -> str:
     store = _unwrap(ctx)
-    username = store.get("username", "guest")
+    if isinstance(store.get("conv"), dict):
+        return _finalize_session_recap_impl(store)
+    # Legacy path (no conversation state): the in-turn emotion log only.
     log = store.get("emotion_log", [])
     if not log:
-        body = "Brief check-in; no notable thoughts logged."
+        body = _EMPTY_RECAP
     else:
         moods = ", ".join(f"{e['mood']}({e['intensity']})" for e in log[-5:])
         body = f"Emotions: {moods}. Triggers: {'; '.join(e['trigger'] for e in log[-5:])}."
-    session.save_recap(username, body)
-    from server import memory_rollup
-    memory_rollup.maybe_rollup_week(username)
-    memory_rollup.maybe_rollup_month(username)
+    owner = _owner(store)
+    session.save_recap(owner, body)
+    if not session.is_anonymous(str(store.get("username") or "guest")):
+        try:
+            from server import memory_rollup
+            memory_rollup.maybe_rollup_week(owner)
+            memory_rollup.maybe_rollup_month(owner)
+        except Exception:
+            pass
     return body
 
 

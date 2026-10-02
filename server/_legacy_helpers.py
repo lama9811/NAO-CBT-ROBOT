@@ -766,7 +766,9 @@ async def run_agent_streamed(
                 "actions": actions, "suppress_image": suppress}
         return
 
-    agent = pick_initial_agent(username, hint, transcript)
+    # Same dict every turn of this conversation (CBT step, lane...).
+    conv = conversation_state.state_for(username)
+    agent = pick_initial_agent(username, hint, transcript, conv=conv)
     # Phase 11.12 — model override (used by the chat-fallback wrapper to
     # rebuild the same agent against gpt-4o-mini after a nano timeout).
     if model_override:
@@ -781,8 +783,7 @@ async def run_agent_streamed(
     sess = session.get_or_create_session(username)
     ctx = {
         "username": username,
-        # Same dict every turn of this conversation (CBT step, lane...).
-        "conv": conversation_state.state_for(username),
+        "conv": conv,
         # Key therapy rows are written under; per-visit for anonymous users.
         "owner": session.therapy_owner(username),
         "actions_queue": [],
@@ -849,6 +850,8 @@ async def run_agent_streamed(
 
     if timeout_task is not None:
         timeout_task.cancel()
+    # Keep (or close) the therapy lane for the next turn.
+    conversation_state.note_turn(conv, active_agent)
     yield {
         "type": "done",
         "reply": final_text,
@@ -924,12 +927,13 @@ def run_agent(username: str, hint: str | None, transcript: str,
     to call ``observe_face`` itself, so the "skipped tool but said 'I can
     see...'" hallucination path is closed.
     """
-    agent = pick_initial_agent(username, hint, transcript)
+    # Same dict every turn of this conversation (CBT step, lane...).
+    conv = conversation_state.state_for(username)
+    agent = pick_initial_agent(username, hint, transcript, conv=conv)
     sess = session.get_or_create_session(username)
     ctx = {
         "username": username,
-        # Same dict every turn of this conversation (CBT step, lane...).
-        "conv": conversation_state.state_for(username),
+        "conv": conv,
         # Key therapy rows are written under; per-visit for anonymous users.
         "owner": session.therapy_owner(username),
         "actions_queue": [],
@@ -944,6 +948,7 @@ def run_agent(username: str, hint: str | None, transcript: str,
     reply, active, _verdict, _metadata = run_topology(
         agent, message, context=ctx, session=sess,
     )
+    conversation_state.note_turn(conv, active)
     return (
         reply,
         active,

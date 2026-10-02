@@ -19,6 +19,33 @@ from server import config
 
 _DB_PATH = config.SESSION_DB
 
+# Full thought-record columns, added 2026-10-01. The table started as just
+# thought + distortion + reframe; existing DBs get the rest by ALTER.
+_THOUGHT_RECORD_COLUMNS = (
+    ("situation", "TEXT NOT NULL DEFAULT ''"),
+    ("emotion", "TEXT NOT NULL DEFAULT ''"),
+    ("intensity_before", "INTEGER"),
+    ("evidence_for", "TEXT NOT NULL DEFAULT ''"),
+    ("evidence_against", "TEXT NOT NULL DEFAULT ''"),
+    ("balanced_thought", "TEXT NOT NULL DEFAULT ''"),
+    ("intensity_after", "INTEGER"),
+)
+# DB paths already migrated in this process (tests swap _DB_PATH).
+_MIGRATED: set[str] = set()
+
+
+def _migrate_thought_records(c: sqlite3.Connection) -> None:
+    if _DB_PATH in _MIGRATED:
+        return
+    have = {row[1] for row in c.execute("PRAGMA table_info(thought_records)")}
+    for name, decl in _THOUGHT_RECORD_COLUMNS:
+        if name not in have:
+            try:
+                c.execute(f"ALTER TABLE thought_records ADD COLUMN {name} {decl}")
+            except sqlite3.OperationalError:
+                pass  # another connection added it first
+    _MIGRATED.add(_DB_PATH)
+
 
 @contextmanager
 def _conn():
@@ -100,6 +127,23 @@ def _conn():
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_thought_records_user_ts "
         "ON thought_records(username, created_at DESC)"
+    )
+    _migrate_thought_records(c)
+    # Small, student-chosen between-session activities ("a 10-minute walk
+    # before your 2pm class"). Written by emotion.assign_homework, reviewed
+    # by emotion.review_homework, surfaced by memory.build_context_preamble.
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS homework ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, "
+        "task TEXT NOT NULL, due_hint TEXT NOT NULL DEFAULT '', "
+        "status TEXT NOT NULL DEFAULT 'open', "
+        "outcome TEXT NOT NULL DEFAULT '', "
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_homework_owner "
+        "ON homework(owner, status)"
     )
     try:
         yield c
@@ -221,6 +265,10 @@ def migrate_username(old: str, new: str) -> None:
         if items:
             asyncio.run(new_sess.add_items(items))
         asyncio.run(old_sess.clear_session())
+        # The visit's moods / thought record / homework were filed under
+        # the anonymous key; they belong to the student now too.
+        if old_is_anon:
+            migrate_therapy_owner(old_key, therapy_owner(new))
 
     if old_is_anon:
         retire_anonymous_epoch()
@@ -375,32 +423,94 @@ def set_proactive_enabled(username: str, enabled: bool) -> None:
         )
 
 
-def save_recap(username: str, body: str) -> None:
+# ---------------------------------------------------------------------------
+# Therapy data: recaps, mood log, thought records, homework.
+# ---------------------------------------------------------------------------
+#
+# Every helper here takes an *owner* -- ``therapy_owner(username)`` -- not a
+# raw username. A bare anonymous name ("guest", "", "unknown") is refused on
+# both write and read: before 2026-10-01 every stranger's mood and recap was
+# filed under one shared "guest" owner and read back to the next stranger
+# (9 of 12 mood rows and both recaps on the live Pi). Refusing the bare name
+# here means a caller that forgets to resolve the owner loses the row
+# instead of leaking it, and the old pooled rows are never shown again.
+
+def migrate_therapy_owner(old_owner: str, new_owner: str) -> None:
+    """Re-file one owner's therapy rows under another (anonymous visit ->
+    the student face recognition just named). Never raises."""
+    old, new = _owner_key(old_owner), _owner_key(new_owner)
+    old_raw, new_raw = (_owner_key(old_owner, lower=False),
+                        _owner_key(new_owner, lower=False))
+    if not old or not new or old == new:
+        return
+    try:
+        with _conn() as c:
+            for table, col in (("mood_log", "username"),
+                               ("thought_records", "username"),
+                               ("homework", "owner")):
+                c.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?",
+                          (new, old))
+            c.execute("UPDATE recaps SET username = ? WHERE username = ?",
+                      (new_raw, old_raw))
+    except sqlite3.Error:
+        pass
+
+
+def _owner_key(owner: str, *, lower: bool = True) -> str:
+    """The stored form of ``owner``, or "" when it names nobody."""
+    if is_anonymous(owner):
+        return ""
+    o = (owner or "").strip()
+    return o.lower() if lower else o
+
+
+def save_recap(username: str, body: str) -> int | None:
+    """Store a session recap. Returns the row id (None if refused)."""
+    u = _owner_key(username, lower=False)
+    if not u:
+        return None
     with _conn() as c:
-        c.execute(
-            "INSERT INTO recaps (username, body) VALUES (?, ?)", (username, body)
+        cur = c.execute(
+            "INSERT INTO recaps (username, body) VALUES (?, ?)", (u, body)
         )
+        return int(cur.lastrowid)
+
+
+def update_recap(recap_id: int, body: str) -> None:
+    """Rewrite a recap in place (the same conversation, recapped again)."""
+    with _conn() as c:
+        c.execute("UPDATE recaps SET body = ? WHERE id = ?", (body, recap_id))
 
 
 def load_recent_recaps(username: str, n: int = 3) -> list[str]:
+    u = _owner_key(username, lower=False)
+    if not u:
+        return []
     with _conn() as c:
         rows = c.execute(
             "SELECT body FROM recaps WHERE username = ? ORDER BY id DESC LIMIT ?",
-            (username, n),
+            (u, n),
         ).fetchall()
         return [r[0] for r in rows]
 
 
-# ---------------------------------------------------------------------------
-# Mood log + thought records persistence (ported from nao-therapy).
-# ---------------------------------------------------------------------------
-
 def _norm_user(username: str) -> str:
-    """Normalize username for mood/thought lookups so writes from any
+    """Normalize an owner for mood/thought/homework rows so writes from any
     code path (mixed-case username from session, lowercased face_id from
-    memory preamble) all match the same rows.
+    memory preamble) all match the same rows. "" for anonymous names.
     """
-    return (username or "").strip().lower()
+    return _owner_key(username)
+
+
+def _since_clause(since: float | None) -> tuple[str, tuple]:
+    """SQL fragment limiting rows to those created at/after epoch ``since``.
+
+    ``created_at`` is SQLite's CURRENT_TIMESTAMP: UTC, 'YYYY-MM-DD HH:MM:SS'.
+    """
+    if not since:
+        return "", ()
+    stamp = datetime.fromtimestamp(float(since), tz=timezone.utc)
+    return " AND created_at >= ?", (stamp.strftime("%Y-%m-%d %H:%M:%S"),)
 
 
 def log_mood(username: str, mood: str, intensity: int, trigger: str) -> None:
@@ -416,16 +526,18 @@ def log_mood(username: str, mood: str, intensity: int, trigger: str) -> None:
         )
 
 
-def load_recent_moods(username: str, n: int = 5) -> list[dict]:
+def load_recent_moods(username: str, n: int = 5, *,
+                      since: float | None = None) -> list[dict]:
     """Most recent mood entries, newest first."""
     u = _norm_user(username)
     if not u:
         return []
+    extra, args = _since_clause(since)
     with _conn() as c:
         rows = c.execute(
             "SELECT mood, intensity, trigger, created_at FROM mood_log "
-            "WHERE username = ? ORDER BY id DESC LIMIT ?",
-            (u, n),
+            "WHERE username = ?" + extra + " ORDER BY id DESC LIMIT ?",
+            (u, *args, n),
         ).fetchall()
         return [
             {"mood": r[0], "intensity": r[1],
@@ -434,18 +546,83 @@ def load_recent_moods(username: str, n: int = 5) -> list[dict]:
         ]
 
 
+def _clip_int(value) -> int | None:
+    """A 0-10 rating, or None when the student didn't give one."""
+    try:
+        return max(0, min(10, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 def log_thought_record(username: str, thought: str, distortion: str,
-                        reframe: str = "") -> None:
-    """Append a CBT thought record."""
+                        reframe: str = "") -> int | None:
+    """Append a CBT thought record. Returns the row id (None if refused)."""
     u = _norm_user(username)
     if not u:
-        return
+        return None
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             "INSERT INTO thought_records (username, thought, distortion, reframe) "
             "VALUES (?, ?, ?, ?)",
             (u, str(thought)[:500], str(distortion)[:64], str(reframe)[:500]),
         )
+        return int(cur.lastrowid)
+
+
+def save_full_thought_record(
+    username: str, *, thought: str, distortion: str,
+    situation: str = "", emotion: str = "",
+    intensity_before=None, evidence_for: str = "",
+    evidence_against: str = "", balanced_thought: str = "",
+    intensity_after=None, record_id: int | None = None,
+) -> int | None:
+    """Write the whole thought record.
+
+    ``record_id`` is the row ``identify_distortion`` opened at step 2; it is
+    completed in place so one exercise is one row. Without it (or when that
+    row is gone / belongs to someone else) a new row is inserted.
+
+    ``balanced_thought`` is the one the STUDENT chose or worded, and it is
+    also written to the legacy ``reframe`` column so older readers show the
+    student's own words rather than the model's first suggestion.
+    """
+    u = _norm_user(username)
+    if not u:
+        return None
+    vals = {
+        "thought": str(thought or "")[:500],
+        "distortion": str(distortion or "")[:64],
+        "reframe": str(balanced_thought or "")[:500],
+        "situation": str(situation or "")[:500],
+        "emotion": str(emotion or "")[:64],
+        "intensity_before": _clip_int(intensity_before),
+        "evidence_for": str(evidence_for or "")[:500],
+        "evidence_against": str(evidence_against or "")[:500],
+        "balanced_thought": str(balanced_thought or "")[:500],
+        "intensity_after": _clip_int(intensity_after),
+    }
+    with _conn() as c:
+        if record_id:
+            row = c.execute(
+                "SELECT thought FROM thought_records WHERE id = ? AND username = ?",
+                (int(record_id), u),
+            ).fetchone()
+            if row is not None:
+                if not vals["thought"]:
+                    vals["thought"] = row[0]
+                sets = ", ".join(f"{k} = ?" for k in vals)
+                c.execute(
+                    f"UPDATE thought_records SET {sets} WHERE id = ?",
+                    (*vals.values(), int(record_id)),
+                )
+                return int(record_id)
+        cols = ", ".join(["username", *vals])
+        marks = ", ".join("?" for _ in range(len(vals) + 1))
+        cur = c.execute(
+            f"INSERT INTO thought_records ({cols}) VALUES ({marks})",
+            (u, *vals.values()),
+        )
+        return int(cur.lastrowid)
 
 
 def attach_reframe_to_latest_thought(username: str, thought: str,
@@ -468,23 +645,125 @@ def attach_reframe_to_latest_thought(username: str, thought: str,
             )
 
 
-def load_recent_thought_records(username: str, n: int = 3) -> list[dict]:
+_THOUGHT_FIELDS = (
+    "thought", "distortion", "reframe", "created_at", "situation", "emotion",
+    "intensity_before", "evidence_for", "evidence_against",
+    "balanced_thought", "intensity_after",
+)
+
+
+def load_recent_thought_records(username: str, n: int = 3, *,
+                                since: float | None = None) -> list[dict]:
     """Newest-first list of thought records."""
     u = _norm_user(username)
     if not u:
         return []
+    extra, args = _since_clause(since)
     with _conn() as c:
         rows = c.execute(
-            "SELECT thought, distortion, reframe, created_at "
-            "FROM thought_records WHERE username = ? "
+            "SELECT " + ", ".join(_THOUGHT_FIELDS) + " "
+            "FROM thought_records WHERE username = ?" + extra + " "
             "ORDER BY id DESC LIMIT ?",
+            (u, *args, n),
+        ).fetchall()
+        return [dict(zip(_THOUGHT_FIELDS, r)) for r in rows]
+
+
+HOMEWORK_STATUSES = ("open", "done", "partly", "not_done", "dropped")
+_HOMEWORK_STATUS_ALIASES = {
+    "yes": "done", "completed": "done", "complete": "done", "did_it": "done",
+    "partial": "partly", "partially": "partly", "some": "partly",
+    "no": "not_done", "skipped": "not_done", "didnt": "not_done",
+    "didnt_do_it": "not_done", "not_yet": "not_done",
+    "not_completed": "not_done", "missed": "not_done",
+    "cancelled": "dropped", "canceled": "dropped", "abandoned": "dropped",
+}
+
+
+def add_homework(owner: str, task: str, due_hint: str = "") -> int | None:
+    """Record one between-session activity. Returns the row id."""
+    u = _norm_user(owner)
+    task = (task or "").strip()
+    if not u or not task:
+        return None
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO homework (owner, task, due_hint) VALUES (?, ?, ?)",
+            (u, task[:300], (due_hint or "").strip()[:120]),
+        )
+        return int(cur.lastrowid)
+
+
+def load_open_homework(owner: str, n: int = 3) -> list[dict]:
+    """Open homework, newest first."""
+    u = _norm_user(owner)
+    if not u:
+        return []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, task, due_hint, created_at FROM homework "
+            "WHERE owner = ? AND status = 'open' ORDER BY id DESC LIMIT ?",
             (u, n),
         ).fetchall()
-        return [
-            {"thought": r[0], "distortion": r[1],
-             "reframe": r[2], "created_at": r[3]}
-            for r in rows
-        ]
+    return [{"id": r[0], "task": r[1], "due_hint": r[2], "created_at": r[3]}
+            for r in rows]
+
+
+def load_homework_since(owner: str, since: float | None,
+                        n: int = 5) -> list[dict]:
+    """Homework assigned or reviewed since ``since``, newest first."""
+    u = _norm_user(owner)
+    if not u:
+        return []
+    extra, args = _since_clause(since)
+    extra = extra.replace("created_at", "updated_at")
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, task, due_hint, status, outcome, created_at, updated_at "
+            "FROM homework WHERE owner = ?" + extra + " ORDER BY id DESC LIMIT ?",
+            (u, *args, n),
+        ).fetchall()
+    keys = ("id", "task", "due_hint", "status", "outcome",
+            "created_at", "updated_at")
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def review_homework(owner: str, outcome: str, status: str,
+                    homework_id: int | None = None) -> dict | None:
+    """Close out homework: the given id, else the newest open one.
+
+    Returns the updated row (id, task, status, outcome) or None when there
+    was nothing open to review.
+    """
+    u = _norm_user(owner)
+    if not u:
+        return None
+    norm = (status or "").strip().lower().replace("'", "")
+    norm = norm.replace(" ", "_").replace("-", "_")
+    norm = _HOMEWORK_STATUS_ALIASES.get(norm, norm)
+    if norm not in HOMEWORK_STATUSES or norm == "open":
+        norm = "partly"  # reviewed, but the model's word for it was unclear
+    with _conn() as c:
+        if homework_id:
+            row = c.execute(
+                "SELECT id, task FROM homework WHERE id = ? AND owner = ?",
+                (int(homework_id), u),
+            ).fetchone()
+        else:
+            row = c.execute(
+                "SELECT id, task FROM homework WHERE owner = ? AND status = 'open' "
+                "ORDER BY id DESC LIMIT 1",
+                (u,),
+            ).fetchone()
+        if row is None:
+            return None
+        c.execute(
+            "UPDATE homework SET status = ?, outcome = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (norm, (outcome or "").strip()[:300], row[0]),
+        )
+    return {"id": row[0], "task": row[1], "status": norm,
+            "outcome": (outcome or "").strip()[:300]}
 
 
 # ---------------------------------------------------------------------------

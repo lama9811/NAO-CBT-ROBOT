@@ -18,6 +18,13 @@ Well-known keys (anything else is allowed):
   (see ``set_lane`` / ``active_lane``).
 * ``cbt_step`` -- the thought-record step the CBT coach is on.
 * ``crisis_followup`` -- set after a crisis reply; the next turn checks in.
+* ``started_at`` -- epoch the conversation began; therapy recaps cover
+  only rows written since then.
+* ``therapy_closing`` -- the student said goodbye inside the lane; the
+  therapist gets that turn for a short close, then the lane ends.
+* ``therapy_closed`` -- the visit's recap is written; the lane can end.
+* ``recap_id`` -- the recap row this visit wrote, so a second recap
+  rewrites it instead of adding a duplicate.
 """
 from __future__ import annotations
 
@@ -58,7 +65,10 @@ def state_for(username: str, *, now: float | None = None) -> dict:
     with _lock:
         _prune(stamp)
         _seen[key] = stamp
-        return _states.setdefault(key, {})
+        state = _states.get(key)
+        if state is None:
+            state = _states[key] = {"started_at": stamp}
+        return state
 
 
 def clear(username: str) -> None:
@@ -92,6 +102,20 @@ def active_lane(state: dict, *, now: float | None = None) -> str | None:
         leave_lane(state)
         return None
     return lane
+
+
+def note_turn(state: dict, agent_name: str | None, *,
+              now: float | None = None) -> None:
+    """Update the lane after a turn: a support agent keeps it open, any
+    other agent (the student changed topic) closes it."""
+    if state is None:
+        return
+    if agent_name in SUPPORT_AGENTS:
+        set_lane(state, agent_name, now=now)
+    else:
+        leave_lane(state)
+        state.pop("therapy_closing", None)
+        state.pop("therapy_closed", None)
 
 
 def _reset_for_tests() -> None:

@@ -29,10 +29,20 @@ def test_no_hint_general_chat_uses_fast_chat():
     assert agent.name == "chat"
 
 
-def test_no_hint_emotional_turn_still_uses_router():
+def test_no_hint_emotional_turn_goes_straight_to_therapist():
+    # Python already made the router's call here; the extra hop only
+    # added a second sequential model call (see test_therapy_lane.py).
     agent = pick_initial_agent(
         "alice", None,
         "I'm anxious and overwhelmed about my exam tomorrow.",
+    )
+    assert agent.name == "therapist"
+
+
+def test_no_hint_emotional_turn_with_school_words_still_uses_router():
+    agent = pick_initial_agent(
+        "alice", None,
+        "I'm so stressed about my classes.",
     )
     assert agent.name == "router"
 
