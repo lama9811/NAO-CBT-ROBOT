@@ -10,6 +10,11 @@ Configuration (env vars):
     LOG_FORMAT  "json" (default) or "console" — JSON for prod / aggregation,
                 console (pretty, colorized) for local dev.
     LOG_LEVEL   "INFO" by default. Standard logging levels.
+    LOG_FILE    Optional path. When set, every log line is ALSO written to
+                this file, rotated at LOG_MAX_BYTES (default 10 MB) keeping
+                LOG_BACKUPS old files (default 5). See install_rotating_file.
+    LOG_REDACT  "1" (default) blanks utterance/reply text on therapist,
+                crisis and emotional turns (server/privacy.py).
 
 Auto-injected fields on every event:
     ts          UTC ISO 8601 with millisecond precision (e.g. 2026-05-06T20:00:00.123Z)
@@ -84,6 +89,15 @@ def _utc_iso_ms(_logger, _name, event_dict):
     return event_dict
 
 
+def _redact(logger, name, event_dict):
+    """Blank student words on private turns (server/privacy.py)."""
+    try:
+        from server.privacy import redact_processor
+        return redact_processor(logger, name, event_dict)
+    except Exception:  # noqa: BLE001
+        return event_dict
+
+
 def _dashboard_capture(logger, name, event_dict):
     """Feed the live dashboard (server/dashboard.py). Never raises."""
     try:
@@ -134,6 +148,7 @@ def configure_logging() -> None:
 
     structlog.configure(
         processors=[
+            _redact,
             structlog.processors.add_log_level,
             _utc_iso_ms,
             structlog.processors.format_exc_info,
@@ -147,6 +162,76 @@ def configure_logging() -> None:
     )
 
     _CONFIGURED = True
+
+
+class _RotatingTee:
+    """File-like object for structlog's PrintLogger: each line goes to the
+    original stream AND a size-rotated file."""
+
+    def __init__(self, stream, path: str, max_bytes: int, backups: int):
+        from logging.handlers import RotatingFileHandler
+
+        self._stream = stream
+        self._handler = RotatingFileHandler(
+            path, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
+        self._handler.setFormatter(logging.Formatter("%(message)s"))
+        self._buf = ""
+
+    def write(self, data: str) -> int:
+        try:
+            self._stream.write(data)
+        except Exception:  # noqa: BLE001
+            pass
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            try:
+                self._handler.emit(logging.makeLogRecord(
+                    {"msg": line, "levelno": logging.INFO,
+                     "levelname": "INFO"}))
+            except Exception:  # noqa: BLE001
+                pass
+        return len(data)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+_FILE_INSTALLED = False
+
+
+def install_rotating_file() -> Optional[str]:
+    """When ``LOG_FILE`` is set, tee structlog and stdlib logging into a
+    size-rotated file. Idempotent; returns the path or None when off.
+
+    The server's stdout/stderr redirect (``run.sh`` -> logs/server.log) or
+    journald on the Pi still gets every line; this file is the bounded copy.
+    """
+    global _FILE_INSTALLED
+    path = (os.environ.get("LOG_FILE") or "").strip()
+    if not path:
+        return None
+    if _FILE_INSTALLED:
+        return path
+    try:
+        max_bytes = int(os.environ.get("LOG_MAX_BYTES", str(10 * 1024 * 1024)))
+        backups = int(os.environ.get("LOG_BACKUPS", "5"))
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tee = _RotatingTee(sys.stdout, path, max_bytes, backups)
+        structlog.configure(logger_factory=structlog.PrintLoggerFactory(file=tee))
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(path + ".stdlib", maxBytes=max_bytes,
+                                 backupCount=backups, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logging.getLogger().addHandler(fh)
+        _FILE_INSTALLED = True
+        return path
+    except Exception:  # noqa: BLE001 -- never break startup over a log file
+        return None
 
 
 # Module-level lazy logger. Most callers will do:
@@ -172,6 +257,7 @@ def per_turn_logger(user: str, session_id: str, turn_idx: int) -> structlog.stdl
 __all__ = [
     "ALLOWED_EVENTS",
     "configure_logging",
+    "install_rotating_file",
     "logger",
     "per_turn_logger",
 ]

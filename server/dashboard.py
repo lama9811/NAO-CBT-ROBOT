@@ -116,6 +116,10 @@ def _is_private(ev: dict[str, Any]) -> bool:
     agent = str(ev.get("active_agent") or "")
     outcome = str(ev.get("outcome") or "")
     name = str(ev.get("event") or "")
+    # ``private`` / ``redacted`` come from server/privacy.py (log
+    # redaction): a turn whose words were blanked stays wordless here too.
+    if ev.get("private") or ev.get("redacted"):
+        return True
     return (agent in SUPPORT_AGENTS or "crisis" in agent
             or "crisis" in outcome or "crisis" in name)
 
@@ -379,11 +383,13 @@ def _remote_payload() -> dict[str, Any]:
     """What the Pi sends to the hosted dashboard.
 
     Support-agent and crisis turns never carry words (see _turn_from).
-    DASHBOARD_PUSH_CONVERSATION=0 strips every question and answer too, so
-    only status, service health and counts leave campus.
+    Unless DASHBOARD_PUSH_CONVERSATION=1, every question and answer is
+    stripped too, so only status, service health and counts leave campus.
     """
     snap = snapshot()
-    if os.environ.get("DASHBOARD_PUSH_CONVERSATION", "1") == "0":
+    # Off by default (2026-10-02): words leave campus only when someone
+    # sets DASHBOARD_PUSH_CONVERSATION=1 on purpose.
+    if os.environ.get("DASHBOARD_PUSH_CONVERSATION", "0") != "1":
         for t in snap["turns"]:
             t["question"] = ""
             t["reply"] = ""

@@ -25,7 +25,7 @@ from openai import OpenAI
 
 from server import config, memory, semantic_endpoint, session, vad_silero
 from server.agents import pick_initial_agent
-from server import conversation_state
+from server import conversation_state, safety
 from server.topologies import run_topology
 
 _client = OpenAI(api_key=config.OPENAI_API_KEY)
@@ -793,6 +793,8 @@ async def run_agent_streamed(
     }
     message = _build_user_message(transcript, image_b64, vision_observation,
                                    identity=identity)
+    # One-shot check-in after a crisis reply (safety.mark_crisis).
+    message = safety.apply_crisis_followup(ctx["conv"], message)
 
     active_agent = getattr(agent, "name", "agent")
     reply_parts: list[str] = []
@@ -941,6 +943,8 @@ def run_agent(username: str, hint: str | None, transcript: str,
     }
     message = _build_user_message(transcript, image_b64, vision_observation,
                                    identity=identity)
+    # One-shot check-in after a crisis reply (safety.mark_crisis).
+    message = safety.apply_crisis_followup(ctx["conv"], message)
     reply, active, _verdict, _metadata = run_topology(
         agent, message, context=ctx, session=sess,
     )

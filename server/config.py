@@ -27,6 +27,27 @@ CHATBOT_MODEL = os.environ.get("CHATBOT_MODEL", "gpt-4.1-mini")
 THERAPIST_MODEL = os.environ.get("THERAPIST_MODEL", "gpt-4.1-mini")
 SKILLS_MODEL = os.environ.get("SKILLS_MODEL", "gpt-4.1-nano")
 CRISIS_MODEL = os.environ.get("CRISIS_MODEL", "gpt-4.1")
+# End-of-session summaries (server/memory.py). Routed through llm_compat,
+# so either provider works; it used to be hard-wired to OpenAI gpt-4.1-nano.
+SUMMARY_MODEL = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5")
+# Spoken after the 988 line in the crisis reply. Verified 2026-10-02 on
+# https://www.morgan.edu/counseling-center/about-us/contact-us: main line
+# "443-885-3130" (Mon-Fri 8:30am-5:00pm) and the page's "Need Help Right
+# Now? 1-800-422-0009". Empty string drops the line.
+MORGAN_COUNSELING_TEXT = os.environ.get(
+    "MORGAN_COUNSELING_TEXT",
+    "On campus, the Morgan State Counseling Center is at 443-885-3130 on "
+    "weekdays, and for help right now their line is 1-800-422-0009.",
+)
+# Optional: POST {"level", "ts"} here on every crisis hit (no transcript,
+# no name). Fire-and-forget; off when unset.
+CRISIS_ALERT_WEBHOOK_URL = os.environ.get("CRISIS_ALERT_WEBHOOK_URL", "").strip()
+# Opt-in: delete therapy rows / chat history older than this many days at
+# startup. 0 (the default) keeps everything.
+try:
+    DATA_RETENTION_DAYS = int(os.environ.get("DATA_RETENTION_DAYS", "0") or 0)
+except ValueError:
+    DATA_RETENTION_DAYS = 0
 # NOTE: there is deliberately no CBT_MODEL / GROUNDING_MODEL. Both coaches are
 # therapist sub-agents and read THERAPIST_MODEL (cbt_coach.py,
 # grounding_coach.py). Separate vars existed here but nothing consumed them, so

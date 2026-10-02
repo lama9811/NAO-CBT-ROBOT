@@ -157,7 +157,7 @@ def _install_per_user_mocks(monkeypatch, *, user_replies: dict[str, str],
 
     from server import safety
 
-    def _fake_crisis(_text):
+    def _fake_crisis(_text, **_kw):
         return safety.CrisisResult(positive=False, source="clean")
 
     monkeypatch.setattr(safety, "crisis_check", _fake_crisis)

@@ -140,7 +140,7 @@ def _install_mocks(monkeypatch, *, transcript: str, reply: str,
     #    that does `.positive` / `.source` access doesn't trip.
     from server import safety
 
-    def _fake_crisis(_text):
+    def _fake_crisis(_text, **_kw):
         return safety.CrisisResult(positive=crisis, source="clean" if not crisis else "keyword")
 
     monkeypatch.setattr(safety, "crisis_check", _fake_crisis)

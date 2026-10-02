@@ -45,6 +45,7 @@ from fastapi import (
 )
 
 from server import breathing_pacing, config, memory, motion_trigger, mute_words, openai_tts, safety
+from server import conversation_state, privacy
 
 # Apply the tracing switch (see config.OPENAI_AGENTS_TRACE). Without this
 # the Agents SDK uploads every turn's trace to OpenAI.
@@ -824,6 +825,7 @@ def _system_spoken_lines() -> list[set[str]]:
             globals().get("_ONBOARDING_GREETING", ""),
             globals().get("MUTE_ACK", ""),
             getattr(safety, "HOTLINE_REPLY", ""),
+            getattr(config, "MORGAN_COUNSELING_TEXT", ""),
         ):
             toks = set(_echo_tokens(str(src or "")))
             if len(toks) >= _SYSTEM_LINE_MIN_TOKENS:
@@ -946,6 +948,13 @@ async def _lifespan(_app: FastAPI):
         logging.getLogger("sage.app_ws").error(
             "migration runner failed on boot: %r", e,
         )
+    # Opt-in retention (DATA_RETENTION_DAYS, default 0 = keep everything).
+    if config.DATA_RETENTION_DAYS > 0:
+        pruned = await asyncio.to_thread(privacy.prune_old_data)
+        logging.getLogger("sage.app_ws").info(
+            "data retention (%s days) pruned: %s",
+            config.DATA_RETENTION_DAYS, pruned,
+        )
     # Live dashboard background checks (server/dashboard.py).
     from server import dashboard as _dash
     _dash_tasks = [
@@ -974,6 +983,12 @@ from server.dashboard import (  # noqa: E402
 
 app.include_router(_dashboard_router)
 _install_dashboard_log_hook()
+# First in the chain, so neither the dashboard nor the log file ever sees
+# a support/crisis turn's words (privacy.redact_processor).
+privacy.install_log_redaction()
+# LOG_FILE=... adds a size-rotated copy of the log (logging_setup.py).
+from server.logging_setup import install_rotating_file as _install_log_file  # noqa: E402
+_install_log_file()
 
 
 @app.get("/health")
@@ -1696,6 +1711,7 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
                        phase_ms: dict[str, float]) -> None:
     """Emit the hardcoded 988-hotline reply with TTS, plus a white-eye action."""
     sess.turn_idx += 1
+    reply = safety.hotline_reply()
     await _send_json(ws, _control_frame("crisis_lock",
                                         transcript=transcript,
                                         turn_idx=sess.turn_idx))
@@ -1710,19 +1726,19 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
 
     with _phase("tts_synth_first_chunk", phase_ms):
         mp3 = await asyncio.to_thread(
-            _synth_for, sess.username, safety.HOTLINE_REPLY,
+            _synth_for, sess.username, reply,
             sess.voice_profile_override,
         )
     # Record the hotline reply for the substring/sentence echo guard before
     # we hand audio to the client — the next inbound transcript may echo it.
-    _reset_reply_chunks(sess.username, safety.HOTLINE_REPLY)
+    _reset_reply_chunks(sess.username, reply)
     if mp3:
         # Safety reply: speaks even when muted. See _send_audio_chunk.
         await _send_audio_chunk(
-            ws, sess, _audio_chunk_frame(sess.next_seq(), safety.HOTLINE_REPLY, mp3),
+            ws, sess, _audio_chunk_frame(sess.next_seq(), reply, mp3),
             force=True,
         )
-    legacy.LAST_REPLY[sess.username] = safety.HOTLINE_REPLY
+    legacy.LAST_REPLY[sess.username] = reply
     _arm_post_tts_cooldown(sess)
     await _send_json(ws, _control_frame("tts_ended"))
 
@@ -1730,9 +1746,50 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
         "crisis_block",
         user=sess.username, session_id=sess.session_id,
         turn_idx=sess.turn_idx, phase_ms=phase_ms,
-        transcript=transcript[:200],
-        reply_preview=safety.HOTLINE_REPLY[:80],
+        # No transcript: crisis turns never put the student's words in logs.
+        reply_preview=reply[:80],
         outcome="crisis",
+    )
+
+
+def _after_crisis(sess: _Session, conv: dict,
+                  crisis: "safety.CrisisResult") -> None:
+    """Bookkeeping for a crisis hit: next turn checks in, a no-text
+    safety_events row, the optional webhook, and private logs from here."""
+    level = crisis.source + ("_stitched" if crisis.stitched else "")
+    safety.mark_crisis(conv, level)
+    privacy.mark_private(sess.username)
+    try:
+        from server import session as _session_mod
+        owner = _session_mod.therapy_owner(sess.username)
+    except Exception:  # noqa: BLE001
+        owner = sess.username
+    safety.record_crisis_event(owner, level, sess.turn_idx + 1)
+    safety.send_crisis_alert(level)
+
+
+async def _emit_forget(ws: WebSocket, sess: _Session, step: str,
+                       phase_ms: dict[str, float]) -> None:
+    """Speak the forget-me confirmation, or delete and confirm."""
+    sess.turn_idx += 1
+    if step == "ask":
+        text = privacy.FORGET_CONFIRM_PROMPT
+    elif step == "confirm":
+        counts = await asyncio.to_thread(privacy.forget_user_data,
+                                         sess.username)
+        text = privacy.FORGET_DONE_REPLY
+        logger.info("forget_me", user=sess.username,
+                    session_id=sess.session_id, tables=counts)
+    else:
+        text = privacy.FORGET_CANCELLED_REPLY
+    await _speak_line(ws, sess, text, "tts_synth_first_chunk", phase_ms)
+    await _send_json(ws, _control_frame("tts_ended"))
+    logger.info(
+        "turn_complete",
+        user=sess.username, session_id=sess.session_id,
+        turn_idx=sess.turn_idx, phase_ms=phase_ms,
+        active_agent="privacy", reply_preview=text[:80],
+        outcome="ok", private=True,
     )
 
 
@@ -3016,11 +3073,27 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
 
     # Crisis FIRST — on the raw clip — so a partial like
     # "I keep thinking about" can't be quietly waited on.
+    # Also asks the classifier on every therapy-lane / emotional turn, and
+    # checks the last few user turns stitched together (safety.py).
+    conv = conversation_state.state_for(sess.username)
     with _phase("crisis_check", phase_ms):
-        crisis = await asyncio.to_thread(safety.crisis_check, transcript)
+        crisis = await asyncio.to_thread(
+            safety.crisis_check, transcript,
+            recent=tuple(conv.get("recent_user_turns") or ()),
+            therapy_lane=conversation_state.active_lane(conv) is not None)
     if crisis.positive:
         legacy.consume_partial(sess.username, transcript)
+        _after_crisis(sess, conv, crisis)
         await _emit_crisis(ws, sess, transcript, phase_ms)
+        return
+    safety.remember_turn(conv, transcript)
+
+    # "Forget me" -> spoken yes/no -> delete (privacy.py).
+    forget = privacy.handle_forget_turn(conv, transcript)
+    if forget is not None:
+        legacy.consume_partial(sess.username, transcript)
+        _cancel_pending_vision(sess)
+        await _emit_forget(ws, sess, forget, phase_ms)
         return
 
     if sess.asking_name:
