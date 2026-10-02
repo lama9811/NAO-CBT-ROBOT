@@ -750,6 +750,12 @@ def finalize_session_recap(username: str, *, owner: str | None = None,
     if conv is None:
         conv = conversation_state.state_for(username)
     owner = owner or session.therapy_owner(username)
+    from server import privacy
+    if privacy.forgotten_since(owner, conv.get("started_at")):
+        # "Forget me" landed during this visit (often while a goodbye
+        # recap was still running): write nothing back.
+        conv["therapy_closed"] = True
+        return ""
     body = build_recap_body(owner, conv.get("started_at"))
     recap_id = conv.get("recap_id")
     try:
@@ -762,7 +768,8 @@ def finalize_session_recap(username: str, *, owner: str | None = None,
     except Exception:
         pass
     conv["therapy_closed"] = True
-    if not session.is_anonymous(username):
+    if (not session.is_anonymous(username)
+            and not privacy.forgotten_since(owner, conv.get("started_at"))):
         try:
             from server import memory_rollup
             memory_rollup.maybe_rollup_week(owner)

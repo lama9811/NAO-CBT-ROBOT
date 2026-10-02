@@ -156,7 +156,17 @@ def _leaves_therapy_lane(transcript: str | None) -> bool:
 
 
 def _is_closing(transcript: str | None) -> bool:
-    return _has_phrase((transcript or "").lower(), _CLOSE_PHRASES)
+    """A goodbye inside the lane.
+
+    Also true for anything ``turn_taking.is_goodbye`` accepts: app_ws holds
+    back the first in-lane goodbye expecting this to set
+    ``therapy_closing``, so a goodbye it recognises ("good night", "take
+    care") that this missed left the session unable to close.
+    """
+    if _has_phrase((transcript or "").lower(), _CLOSE_PHRASES):
+        return True
+    from server import turn_taking  # stdlib-only module; no import cycle
+    return turn_taking.is_goodbye(transcript or "")
 
 
 def _clearly_support(transcript: str | None) -> bool:

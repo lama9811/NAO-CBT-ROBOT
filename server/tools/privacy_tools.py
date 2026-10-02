@@ -18,9 +18,13 @@ def _forget_me_impl(ctx: RunContextWrapper, confirmed: bool) -> str:
                 "everything deleted, then call again with confirmed=true.")
     c = getattr(ctx, "context", None) or {}
     username = c.get("username") or ""
-    privacy.forget_user_data(username)
+    # Deleted once this run ends (_legacy_helpers): deleting now would be
+    # undone, because the SDK saves this turn to the history afterwards.
+    privacy.request_forget_after_run(username)
     return ("deleted: their chat history, moods, thought records, homework "
-            "and recaps are gone. Tell them plainly that it is done.")
+            "and recaps are being erased as this reply ends. Tell them "
+            "plainly that it is done, and that NAO may still recognise "
+            "their face; a staff member can remove that if they want.")
 
 
 @function_tool

@@ -714,6 +714,16 @@ def _build_user_message(transcript: str, image_b64: str | None,
     }]
 
 
+def _run_pending_forget(username: str) -> None:
+    """Run a ``forget_me`` deletion queued during the agent run (see
+    ``server/tools/privacy_tools.py``). Never raises."""
+    try:
+        from server import privacy
+        privacy.run_pending_forget(username)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run_agent_streamed(
     username: str, hint: str | None, transcript: str,
     image_b64: str | None, vision_observation: dict | None = None,
@@ -847,6 +857,7 @@ async def run_agent_streamed(
         except Exception:
             final_text = "".join(reply_parts)
     except Exception as e:  # noqa: BLE001
+        _run_pending_forget(username)
         yield {"type": "error", "error": repr(e)}
         return
 
@@ -854,6 +865,8 @@ async def run_agent_streamed(
         timeout_task.cancel()
     # Keep (or close) the therapy lane for the next turn.
     conversation_state.note_turn(conv, active_agent)
+    # A forget_me call this turn: delete now that the SDK has saved it.
+    _run_pending_forget(username)
     yield {
         "type": "done",
         "reply": final_text,
@@ -953,6 +966,8 @@ def run_agent(username: str, hint: str | None, transcript: str,
         agent, message, context=ctx, session=sess,
     )
     conversation_state.note_turn(conv, active)
+    # A forget_me call this turn: delete now that the SDK has saved it.
+    _run_pending_forget(username)
     return (
         reply,
         active,

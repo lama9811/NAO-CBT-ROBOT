@@ -185,7 +185,9 @@ def _ingest_event(ev: dict[str, Any]) -> None:
             if name == "turn_rejected":
                 turn["outcome"] = "rejected"
             STATE.turns.appendleft(turn)
-            if turn["outcome"] == "ok":
+            # A goodbye is a turn NAO answered ("Bye! Take care."), not a
+            # dropped one.
+            if turn["outcome"] in ("ok", "goodbye"):
                 STATE.today["answered"] += 1
                 if turn["agent"] == "cs_direct" or turn["agent"] == "chatbot":
                     STATE.today["cs"] += 1

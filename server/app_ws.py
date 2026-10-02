@@ -1871,7 +1871,7 @@ def _is_recent_turn_line_echo(sess: "_Session", transcript: str) -> bool:
 
 
 async def _speak_turn_line(ws: WebSocket, sess: "_Session", text: str,
-                           kind: str) -> bool:
+                           kind: str, recheck: Any = None) -> bool:
     """Say one short turn-taking line (repair / idle check-in / goodbye).
 
     Follows the mute-ack pattern: never forced through mute, registered
@@ -1888,6 +1888,12 @@ async def _speak_turn_line(ws: WebSocket, sess: "_Session", text: str,
                        kind=kind, error=repr(exc))
         return False
     if not mp3:
+        return False
+    # Synthesis takes a moment; `recheck` lets an unprompted line (the idle
+    # check-in) stand down if the user started talking meanwhile.
+    if recheck is not None and not recheck():
+        logger.info("turn_line_aborted", user=sess.username,
+                    session_id=sess.session_id, kind=kind)
         return False
     _record_reply_chunk(sess.username, text)
     _note_turn_line(sess, text)
@@ -1968,6 +1974,19 @@ def _claim_idle_checkin(sess: "_Session") -> bool:
     return True
 
 
+def _idle_checkin_still_ok(sess: "_Session") -> bool:
+    """Re-checked after synthesis: the user may have started talking, a
+    turn may have begun, or NAO may have been muted in the meantime."""
+    return not (sess.muted or sess.had_speech or sess._finalize_in_flight
+                or _agent_turn_running(sess))
+
+
+async def _speak_idle_checkin(ws: WebSocket, sess: "_Session") -> bool:
+    return await _speak_turn_line(
+        ws, sess, turn_taking.IDLE_CHECKIN_LINE, "idle_checkin",
+        recheck=lambda: _idle_checkin_still_ok(sess))
+
+
 async def _maybe_idle_checkin(ws: WebSocket, sess: "_Session") -> bool:
     """Say "I'm still here whenever you're ready." once per long silence.
 
@@ -1977,8 +1996,7 @@ async def _maybe_idle_checkin(ws: WebSocket, sess: "_Session") -> bool:
     """
     if not _claim_idle_checkin(sess):
         return False
-    return await _speak_turn_line(
-        ws, sess, turn_taking.IDLE_CHECKIN_LINE, "idle_checkin")
+    return await _speak_idle_checkin(ws, sess)
 
 
 async def _emit_goodbye(ws: WebSocket, sess: "_Session", transcript: str,
@@ -1994,10 +2012,23 @@ async def _emit_goodbye(ws: WebSocket, sess: "_Session", transcript: str,
     retired so the next stranger does not inherit this conversation.
     """
     sess.turn_idx += 1
+    lane = _support_lane(sess.username)
+    # Close the conversation NOW, before any await: a turn arriving while
+    # the goodbye is spoken or the recap runs must start fresh and keep
+    # whatever it sets (crisis follow-up, forget-me, a new lane). The
+    # recap works from this snapshot.
+    snapshot, owner = _detach_conversation(sess.username)
+    # Nothing left to check in on or repair until someone speaks again
+    # (_mark_turn_accepted re-arms both).
+    sess.idle_checkin_done = True
+    sess.user_turns = 0
+    sess.repair_armed = False
     await _send_json(ws, _control_frame(
         "transcript", transcript=transcript,
         stt_ms=phase_ms.get("stt", 0)))
-    lane = _support_lane(sess.username)
+    # Muted: the reply is silent (_speak_turn_line never forces through
+    # mute) but the conversation still closes on purpose -- the person is
+    # leaving, and the next visitor must not inherit this one's state.
     await _speak_turn_line(ws, sess, turn_taking.goodbye_reply(lane),
                            "goodbye")
     await _send_json(ws, _control_frame("conversation_closed",
@@ -2011,7 +2042,8 @@ async def _emit_goodbye(ws: WebSocket, sess: "_Session", transcript: str,
     )
     # The recap is an LLM call; run the close in the background so the
     # receive loop keeps draining frames meanwhile.
-    task = asyncio.create_task(_close_conversation(sess.username, lane))
+    task = asyncio.create_task(_close_conversation(
+        sess.username, lane, owner=owner, conv=snapshot))
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
@@ -2019,9 +2051,38 @@ async def _emit_goodbye(ws: WebSocket, sess: "_Session", transcript: str,
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
-async def _close_conversation(username: str, lane: str | None) -> str:
-    """Finalize the recap (support conversations only), then forget the
-    conversation. Returns the recap status, for the log and tests."""
+def _detach_conversation(username: str) -> tuple[dict, str]:
+    """Snapshot the conversation state and its therapy owner, then clear
+    it and retire an anonymous epoch. Synchronous, so nothing can slip in
+    between the snapshot and the clear. Returns ``(snapshot, owner)``."""
+    snapshot: dict = {}
+    owner = username
+    try:
+        from server import conversation_state as _cs
+        from server import session as _ses
+        snapshot = dict(_cs.state_for(username))
+        owner = _ses.therapy_owner(username)
+        _cs.clear(username)
+        if _ses.is_anonymous(username):
+            _ses.retire_anonymous_epoch()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("goodbye_state_clear_failed", user=username,
+                       error=repr(exc))
+    return snapshot, owner
+
+
+async def _close_conversation(username: str, lane: str | None, *,
+                              owner: str | None = None,
+                              conv: dict | None = None) -> str:
+    """Finalize the recap (support conversations only) from the closed
+    conversation's snapshot. Returns the recap status, for the log and
+    tests.
+
+    ``_emit_goodbye`` detaches the state itself and passes ``owner`` /
+    ``conv``; called without them, the state is detached here first.
+    """
+    if conv is None:
+        conv, owner = _detach_conversation(username)
     recap_status = "skipped"
     if lane:
         fn = getattr(_emotion_module, "finalize_session_recap", None)
@@ -2030,21 +2091,13 @@ async def _close_conversation(username: str, lane: str | None) -> str:
         else:
             try:
                 await asyncio.wait_for(
-                    asyncio.to_thread(fn, username), timeout=30.0)
+                    asyncio.to_thread(fn, username, owner=owner, conv=conv),
+                    timeout=30.0)
                 recap_status = "ok"
             except Exception as exc:  # noqa: BLE001 -- the goodbye already landed
                 recap_status = "failed"
                 logger.warning("goodbye_recap_failed", user=username,
                                error=repr(exc))
-    try:
-        from server import conversation_state as _cs
-        from server import session as _ses
-        _cs.clear(username)
-        if _ses.is_anonymous(username):
-            _ses.retire_anonymous_epoch()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("goodbye_state_clear_failed", user=username,
-                       error=repr(exc))
     logger.info("conversation_closed", user=username, support_lane=lane,
                 recap=recap_status)
     return recap_status
@@ -2136,12 +2189,31 @@ async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
     )
 
 
+def _goodbye_fast_path(sess: _Session, conv: dict, transcript: str) -> bool:
+    """Whether this turn's goodbye is answered by the canned close.
+
+    Not while a crisis check-in is pending: a cheerful "bye" right after the
+    988 reply would also clear the follow-up flag, so the agent turn takes
+    it (with the check-in note). Not for the first goodbye inside the
+    support lane either -- the therapist closes the visit.
+    """
+    if not (turn_taking.GOODBYE_ENABLED and turn_taking.is_goodbye(transcript)):
+        return False
+    if conv.get("crisis_followup"):
+        return False
+    if _support_lane(sess.username) and not conv.get("therapy_closing"):
+        return False
+    return True
+
+
 def _after_crisis(sess: _Session, conv: dict,
                   crisis: "safety.CrisisResult") -> None:
     """Bookkeeping for a crisis hit: next turn checks in, a no-text
     safety_events row, the optional webhook, and private logs from here."""
     level = crisis.source + ("_stitched" if crisis.stitched else "")
     safety.mark_crisis(conv, level)
+    # The follow-up check-in belongs to the support agent, not casual chat.
+    conversation_state.set_lane(conv, "therapist")
     privacy.mark_private(sess.username)
     try:
         from server import session as _session_mod
@@ -2291,6 +2363,14 @@ async def _emit_cs_direct(ws: WebSocket, sess: "_Session", transcript: str,
             (first_audio_at - t_user_done) * 1000, 2)
     phase_ms["e2e_user_to_answer"] = round(
         (time.perf_counter() - t_user_done) * 1000, 2)
+
+    # A CS question is a change of topic: leave the therapy lane, as the
+    # agent path does for any non-support agent.
+    try:
+        conversation_state.note_turn(
+            conversation_state.state_for(sess.username), "cs_direct")
+    except Exception:  # noqa: BLE001
+        pass
 
     # Keep the exchange in the conversation history so a follow-up
     # ("and what about the other section?") has context in the agent path.
@@ -3515,9 +3595,7 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     # Inside the support lane the first goodbye goes to the therapist, who
     # closes the visit (summary + optional homework, agents._resume_lane);
     # only a goodbye after that close, or outside the lane, is answered here.
-    if (turn_taking.GOODBYE_ENABLED and turn_taking.is_goodbye(transcript)
-            and not (_support_lane(sess.username)
-                     and not conv.get("therapy_closing"))):
+    if _goodbye_fast_path(sess, conv, transcript):
         _cancel_pending_vision(sess)
         legacy.consume_partial(sess.username, transcript)
         sess.asking_name = False
@@ -3842,8 +3920,7 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
         # from a task so synthesis never stalls the receive loop; the
         # claim is taken synchronously so it cannot fire twice.
         if not sess.had_speech and _claim_idle_checkin(sess):
-            task = asyncio.create_task(_speak_turn_line(
-                ws, sess, turn_taking.IDLE_CHECKIN_LINE, "idle_checkin"))
+            task = asyncio.create_task(_speak_idle_checkin(ws, sess))
             _BACKGROUND_TASKS.add(task)
             task.add_done_callback(_BACKGROUND_TASKS.discard)
 

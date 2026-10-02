@@ -186,4 +186,7 @@ def test_forget_me_tool_requires_confirmation(db):
     assert privacy_tools._forget_me_impl(Ctx(), False).startswith("not_confirmed")
     assert _count(db, "mood_log") == 1
     assert privacy_tools._forget_me_impl(Ctx(), True).startswith("deleted")
+    # Deferred until the agent run ends, so the SDK cannot re-save the turn.
+    assert _count(db, "mood_log") == 1
+    privacy.run_pending_forget("Alice")
     assert _count(db, "mood_log") == 0

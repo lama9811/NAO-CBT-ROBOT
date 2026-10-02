@@ -96,6 +96,14 @@ _SOFT_TRIGGERS = (
     "kms", "unalive", "overdose", "going to jump", "jump off",
     "jump in front", "self harm", "want it all to stop", "sleep forever",
     "say goodbye to everyone", "take my life", "do not want to live",
+    # "Everyone would be fine without me" -- specific "<better> without me"
+    # forms only; a bare "without me" ("they left without me") is not.
+    "fine without me", "happier without me", "easier without me",
+    "better without me", "okay without me", "ok without me",
+    "would not notice if i", "would not even notice if i",
+    "nobody would notice if i", "no one would notice if i",
+    "would anyone notice if i", "would anyone even notice if i",
+    "notice if i was gone", "notice if i were gone", "miss me if i",
 )
 
 # Soft patterns that need more than a substring.
@@ -216,8 +224,14 @@ def crisis_check(text: str, *, recent=(), therapy_lane: bool = False
             if _llm_classify(joined):
                 return CrisisResult(True, "llm", stitched=not soft_now)
             return CrisisResult(False, "llm")
-        except Exception:
-            return CrisisResult(True, "failsafe", stitched=not soft_now)
+        except Exception as exc:  # noqa: BLE001
+            if soft_now:
+                return CrisisResult(True, "failsafe")
+            # Only the stitched text matched: an earlier turn already went
+            # through the gate on its own, so during an outage this would
+            # answer ordinary follow-ups with the hotline. Fail open.
+            _log.warning("crisis_stitched_classifier_failed: %r", exc)
+            return CrisisResult(False, "clean_llm_error")
 
     if (_always_on()
             and len(normalize(text).split()) >= _min_words()

@@ -87,6 +87,58 @@ def _history_keys(username: str) -> list[str]:
     return [session.session_key_for(username)]
 
 
+# Tombstones: owner key (lowercased) -> when it was forgotten. A goodbye
+# recap runs in the background for up to ~30 s; one that started before a
+# "forget me" must not write the deleted visit back afterwards
+# (``forgotten_since``). In memory only, and pruned after a day.
+FORGET_TOMBSTONE_S = 86400.0
+_tomb_lock = threading.Lock()
+_forgotten: dict[str, float] = {}
+
+# Usernames whose ``forget_me`` tool call is waiting for the agent run to
+# end. Deleting mid-run is undone: the SDK saves the turn's items to the
+# chat history after the tool returns.
+_pending_forget: set[str] = set()
+
+
+def _record_tombstones(keys: list[str], stamp: float) -> None:
+    with _tomb_lock:
+        for k in [k for k, t in _forgotten.items()
+                  if stamp - t > FORGET_TOMBSTONE_S]:
+            _forgotten.pop(k, None)
+        for k in keys:
+            _forgotten[k.lower()] = stamp
+
+
+def forgotten_since(owner: str | None, since: float | None) -> bool:
+    """True when ``owner`` asked to be forgotten at or after ``since``
+    (any time in the last day when ``since`` is None)."""
+    if not owner:
+        return False
+    with _tomb_lock:
+        stamp = _forgotten.get(str(owner).strip().lower())
+    if stamp is None:
+        return False
+    return since is None or stamp >= float(since)
+
+
+def request_forget_after_run(username: str) -> None:
+    """Queue ``forget_user_data(username)`` for when the agent run ends."""
+    with _tomb_lock:
+        _pending_forget.add((username or "").strip().lower())
+
+
+def run_pending_forget(username: str) -> dict[str, int] | None:
+    """Run a queued forget for ``username``; None when nothing was queued.
+    Called by the agent runners after ``Runner`` returns."""
+    key = (username or "").strip().lower()
+    with _tomb_lock:
+        if key not in _pending_forget:
+            return None
+        _pending_forget.discard(key)
+    return forget_user_data(username)
+
+
 def forget_user_data(username: str) -> dict[str, int]:
     """Delete everything stored about ``username``. Returns rows deleted
     per table (for the log; no content). Never raises.
@@ -98,6 +150,7 @@ def forget_user_data(username: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     owners = [k.lower() for k in _owner_keys(username)]
     history = _history_keys(username)
+    _record_tombstones(owners, time.time())
     try:
         with _connect() as c:
             for table in THERAPY_TABLES + ("user_prefs",):
@@ -166,7 +219,13 @@ FORGET_CONFIRM_PROMPT = (
     "Do you want me to delete everything I have saved about you, including "
     "our conversations? Say yes to confirm."
 )
-FORGET_DONE_REPLY = "Done. I've deleted everything I had saved about you."
+# Honest about the one thing the server cannot delete: the face template
+# lives on the robot (ALFaceDetection), not in the server database.
+FORGET_DONE_REPLY = (
+    "Done. I've deleted our conversations and what I had saved about you. "
+    "I may still recognise your face; ask a staff member if you'd like "
+    "that removed too."
+)
 FORGET_CANCELLED_REPLY = "Okay, I won't delete anything."
 
 
@@ -359,3 +418,6 @@ def install_log_redaction() -> None:
 def _reset_for_tests() -> None:
     with _private_lock:
         _private_until.clear()
+    with _tomb_lock:
+        _forgotten.clear()
+        _pending_forget.clear()

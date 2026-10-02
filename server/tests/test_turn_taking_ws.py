@@ -305,7 +305,7 @@ class TestGoodbye:
     def test_support_goodbye_finalizes_recap_and_clears_state(self, monkeypatch):
         calls = []
         monkeypatch.setattr(app_ws._emotion_module, "finalize_session_recap",
-                            lambda username: calls.append(username),
+                            lambda username, **kw: calls.append(username),
                             raising=False)
         state = conversation_state.state_for("tt_support")
         conversation_state.set_lane(state, "therapist")
@@ -325,7 +325,7 @@ class TestGoodbye:
     def test_no_recap_outside_support_lane(self, monkeypatch):
         calls = []
         monkeypatch.setattr(app_ws._emotion_module, "finalize_session_recap",
-                            lambda username: calls.append(username),
+                            lambda username, **kw: calls.append(username),
                             raising=False)
         assert asyncio.run(app_ws._close_conversation(
             "tt_chat", None)) == "skipped"
