@@ -735,12 +735,26 @@ key every 5 minutes, so this shows in red immediately.
   batch `has_voice`/`trim_silence` still share the singleton — stateless use).
   Regression test: `server/tests/test_silero_per_session.py`. If `no_voice`
   rejections ever return, first check that fix is still present, then restart.
-- **The crisis gate only consults the LLM when a keyword matches.** No match in
-  `_SOFT_TRIGGERS` → returns `clean` without any model call. It matches
-  contracted forms only, so *"I do not want to be here anymore"* misses (the
-  list has `"don't want to be here"`), as do *"I want to disappear"* and
-  *"I feel like a burden"*. Upgrading `CRISIS_MODEL` does not help — the model
-  never sees those messages.
+- **Crisis gate missed uncontracted and indirect wording — FIXED 2026-10-02.**
+  It matched contracted forms only (*"I do not want to be here anymore"*
+  missed) and asked the LLM only on a keyword hit. Now `safety.normalize()`
+  expands contractions and strips punctuation before matching; "disappear",
+  "a burden", "kms", saving pills etc. are soft triggers; every therapy-lane
+  or emotional turn asks `CRISIS_MODEL` too (fails *open* on a classifier
+  error — the keyword layers are the fail-safe; `CRISIS_ALWAYS_ON=0` turns it
+  off); and the last 3 user turns are checked stitched together. A hit writes
+  a no-text `safety_events` row, POSTs `{level, ts}` to
+  `CRISIS_ALERT_WEBHOOK_URL` if set, and sets `ctx["conv"]["crisis_followup"]`
+  so the next reply checks in. The reply adds the Morgan Counseling Center
+  (`MORGAN_COUNSELING_TEXT`, verified on morgan.edu 2026-10-02). Costs one
+  classifier call on emotional turns. Tests: `test_crisis_gate_v2.py`,
+  `test_crisis_followup.py`.
+- **Privacy (2026-10-02, `server/privacy.py`).** "Forget me" / "delete my
+  data" asks for a spoken yes, then deletes chat history, moods, thought
+  records, homework, recaps and profile (crisis rows are kept, de-identified).
+  `DATA_RETENTION_DAYS` (default 0 = off) prunes old rows at startup. Log
+  lines for therapist/crisis/emotional turns carry `[redacted]` instead of
+  words (`LOG_REDACT=0` to disable); `LOG_FILE` adds a size-rotated copy.
 - **The therapy lane does not persist.** Routing is recomputed per turn from
   keywords, so a follow-up phrased without a trigger word silently drops from
   `therapist` back to `chat`, losing the CBT tools and coach handoffs
@@ -771,7 +785,8 @@ conversation, today's numbers, and recent warnings.
   from the cloud, so it POSTs its snapshot to `DASHBOARD_REMOTE_URL/api/ingest`
   every 10 s with `DASHBOARD_INGEST_SECRET`; the site keeps the latest copy
   in Upstash Redis and shows "The Pi has stopped reporting" after 45 s of
-  silence. `DASHBOARD_PUSH_CONVERSATION=0` sends status only. The page and
+  silence. Status only by default since 2026-10-02;
+  `DASHBOARD_PUSH_CONVERSATION=1` adds non-support questions and answers. The page and
   photo are copies of `server/dashboard_static/`; a test fails on drift.
 - Code: `server/dashboard.py` (fed by a structlog processor in
   `logging_setup.py`, so no conversation code calls it) and

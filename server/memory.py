@@ -12,13 +12,11 @@ import threading
 import time
 from contextlib import contextmanager
 
-from openai import OpenAI
-
-from server import config
+from server import config, llm_compat
 
 _DB_PATH = config.SESSION_DB
-_SUMMARY_MODEL = "gpt-4.1-nano"
-_client = OpenAI(api_key=config.OPENAI_API_KEY)
+# Routed through llm_compat so SUMMARY_MODEL can name either provider.
+_SUMMARY_MODEL = getattr(config, "SUMMARY_MODEL", "claude-haiku-4-5")
 
 
 # ───────── schema ─────────
@@ -204,9 +202,10 @@ def summarize_session_async(session_id: int, transcript_lines: list[str]) -> Non
             transcript = "\n".join(s for s in transcript_lines if s)
             if not transcript.strip():
                 return
-            resp = _client.chat.completions.create(
+            summary = (llm_compat.chat(
                 model=_SUMMARY_MODEL,
                 temperature=0.2,
+                max_tokens=200,
                 messages=[
                     {"role": "system",
                      "content": ("Summarize this conversation between a user and "
@@ -215,8 +214,7 @@ def summarize_session_async(session_id: int, transcript_lines: list[str]) -> Non
                                  "feelings the user expressed. Past tense, third person.")},
                     {"role": "user", "content": transcript[:8000]},
                 ],
-            )
-            summary = (resp.choices[0].message.content or "").strip()
+            ) or "").strip()
             if not summary:
                 return
             with _conn() as c:

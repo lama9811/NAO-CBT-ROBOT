@@ -202,8 +202,21 @@ wait_for_health() {
     die "$label failed to come up — see $SERVER_LOG"
 }
 
+# Keep the last 3 runs' logs instead of overwriting server.log on every
+# start (server.log.1 is the previous run). For a size cap within one run,
+# set LOG_FILE in .env -- see server/logging_setup.py.
+rotate_server_log() {
+    local i
+    for i in 2 1; do
+        [ -f "$SERVER_LOG.$i" ] && mv -f "$SERVER_LOG.$i" "$SERVER_LOG.$((i + 1))"
+    done
+    [ -f "$SERVER_LOG" ] && mv -f "$SERVER_LOG" "$SERVER_LOG.1"
+    return 0
+}
+
 start_server() {
     local port pid
+    rotate_server_log
     port="$SERVER_BIND_PORT"
     if lsof -ti ":$port" >/dev/null 2>&1; then
         warn "port $port already in use, killing"

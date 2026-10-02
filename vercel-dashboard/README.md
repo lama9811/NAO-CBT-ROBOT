@@ -19,5 +19,6 @@ fails if they drift. Edit the originals and copy them here.
    same `DASHBOARD_INGEST_SECRET`, then restart nao-server.
 
 There is no login: anyone with the link can view the page. Support-agent
-and crisis turns are never sent. Set
-`DASHBOARD_PUSH_CONVERSATION=0` on the Pi to send status only.
+and crisis turns are never sent. By default the Pi sends status only (no
+words at all); set `DASHBOARD_PUSH_CONVERSATION=1` on the Pi to include
+non-support questions and answers.

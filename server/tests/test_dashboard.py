@@ -121,7 +121,8 @@ def test_hook_is_live_under_the_default_structlog_chain():
 
 
 # ───────────────────────── hosted (Vercel) copy ──────────────────────────
-def test_remote_payload_never_carries_support_words():
+def test_remote_payload_never_carries_support_words(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_PUSH_CONVERSATION", "1")
     _turn("therapist", "private words", "private reply")
     _turn("cs_direct", "Who teaches COSC 220?", "Jin Guo.")
     turns = d._remote_payload()["turns"]
