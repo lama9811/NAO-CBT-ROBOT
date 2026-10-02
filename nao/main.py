@@ -590,8 +590,12 @@ class _SessionController(object):
             edge-case face flicker.
     """
 
-    def __init__(self, log, audio, tts, vad, brain, life_guard=None):
+    def __init__(self, log, audio, tts, vad, brain, life_guard=None,
+                 leds=None):
         self._log = log
+        # LedDriver handed to each WS client for turn-taking eye colours
+        # (server `turn_state` / `led_breath` controls).
+        self._leds = leds
         self._life_guard = life_guard
         if life_guard is not None:
             life_guard.on_redisabled = self._on_life_redisabled
@@ -782,6 +786,10 @@ class _SessionController(object):
                 self._log.exception("ws_client_build_failed", error=str(exc))
                 self._stop_audio_safe()
                 return
+            try:
+                self._client.leds = self._leds
+            except Exception as exc:
+                self._log.debug("ws_leds_attach_failed", error=str(exc))
 
             # 3. Wire the live WS client into the AdaptiveVad so EoU hints
             # ride the same socket. AdaptiveVad accepts any object with
@@ -1371,7 +1379,7 @@ def main():
             fallback = _build_wake_listener(log)
 
             session = _SessionController(log, audio, tts, vad, brain,
-                                         life_guard=life_guard)
+                                         life_guard=life_guard, leds=leds)
 
             # ------------------------------------------------------------------
             # Wake-state callbacks. These run on the WSM thread; they delegate

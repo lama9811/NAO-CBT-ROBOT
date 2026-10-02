@@ -192,6 +192,16 @@ class LedDriver(object):
     DUR_LISTENING = 0.3
     DUR_SPEAKING = 0.2
 
+    # Turn-taking "thinking" cue: the ENGAGED blue, pulsing slowly while the
+    # server works out a reply. Not purple -- purple eyes mean Autonomous
+    # Life's sleep mode on this robot.
+    THINKING_PERIOD_S = 1.4
+
+    # Paced breathing: eyes brighten on the inhale and dim on the exhale.
+    COLOR_BREATH = (0.10, 0.80, 0.95)      # same cyan as LISTENING
+    BREATH_LOW_INTENSITY = 0.12
+    BREATH_MAX_S = 10.0
+
     # Master volume to set on ALAudioPlayer before chime playback. 1.0 is
     # the documented max. The H25 chassis speaker pegs ~80 dB at this volume
     # for a full-scale 220 Hz tone.
@@ -433,6 +443,42 @@ class LedDriver(object):
     def set_speaking(self):
         """Eyes warm yellow -- SPEAKING state."""
         self.fade(self.EYES_GROUP, self.COLOR_YELLOW, self.DUR_SPEAKING)
+
+    def set_thinking(self):
+        """Eyes pulse the ENGAGED blue -- NAO is working out a reply."""
+        self.pulse(self.EYES_GROUP, self.COLOR_SOLID_BLUE,
+                   period_s=self.THINKING_PERIOD_S)
+
+    def breathe(self, phase, seconds):
+        """Follow one breathing phase with the eyes.
+
+        ``inhale`` fades up to full brightness over ``seconds``, ``exhale``
+        fades down to a dim glow, ``hold`` keeps the current level. Runs
+        on a daemon thread: ``ALLeds.fadeRGB`` can block for the whole
+        ramp, and the caller is the TTS worker, which must not stall.
+        """
+        if self._disabled:
+            return
+        try:
+            seconds = max(0.2, min(self.BREATH_MAX_S, float(seconds)))
+        except (TypeError, ValueError):
+            seconds = 2.0
+        phase = str(phase or "").lower()
+        if phase == "inhale":
+            target = self.COLOR_BREATH
+        elif phase == "exhale":
+            target = _scale_rgb(self.COLOR_BREATH, self.BREATH_LOW_INTENSITY)
+        elif phase == "hold":
+            # Stop any pulse so the level we reached simply stays.
+            self.stop_pulse(self.EYES_GROUP)
+            return
+        else:
+            return
+        t = threading.Thread(target=self.fade,
+                             args=(self.EYES_GROUP, target, seconds),
+                             name="LedBreath")
+        t.daemon = True
+        t.start()
 
     # ------------------------------------------------------------------
     # public: chime

@@ -45,7 +45,7 @@ from fastapi import (
 )
 
 from server import breathing_pacing, config, memory, motion_trigger, mute_words, openai_tts, safety
-from server import conversation_state, privacy
+from server import conversation_state, privacy, turn_taking
 
 # Apply the tracing switch (see config.OPENAI_AGENTS_TRACE). Without this
 # the Agents SDK uploads every turn's trace to OpenAI.
@@ -101,7 +101,8 @@ def _resolve_voice_profile(username: str, override: str | None) -> str:
 
 
 def _synth_for(username: str, text: str,
-               profile_override: str | None = None) -> bytes | None:
+               profile_override: str | None = None,
+               speed: float | None = None) -> bytes | None:
     """Pick TTS provider per-call. Tries ElevenLabs first when enabled
     and available; falls back to OpenAI on any failure / missing key.
 
@@ -130,7 +131,13 @@ def _synth_for(username: str, text: str,
             voice_id = _eleven._voice_id_for(profile) or \
                        _eleven._resolve_default_voice_id()
             if voice_id:
-                bytes_ = _eleven.synthesize(text, voice_id=voice_id)
+                # `speed` only when asked for (slow breathing / grounding
+                # pacing), so ordinary replies send the same request as before.
+                if speed is not None:
+                    bytes_ = _eleven.synthesize(text, voice_id=voice_id,
+                                                speed=speed)
+                else:
+                    bytes_ = _eleven.synthesize(text, voice_id=voice_id)
                 if bytes_:
                     return bytes_
             # Resolved profile but EL returned no audio — fall through.
@@ -388,6 +395,29 @@ EOU_MIN_SILENCE_MS = int(os.environ.get("EOU_MIN_SILENCE_MS", "500"))
 EOU_HINT_CONFIRM_MS = int(os.environ.get("EOU_HINT_CONFIRM_MS", "150"))
 EOU_SEMANTIC_SILENCE_MS = int(os.environ.get("EOU_SEMANTIC_SILENCE_MS", "200"))
 EOU_HARD_CEILING_MS = int(os.environ.get("EOU_HARD_CEILING_MS", "60_000"))
+# While a support conversation is in progress the robot's 300 ms energy-VAD
+# hint no longer ends the turn on its own (see `turn_taking.eou_silence_ms`);
+# if the robot stops streaming audio after its hint, the turn is forced
+# this long after the silence threshold would have been reached.
+EOU_THERAPY_FALLBACK_SLACK_MS = int(os.environ.get(
+    "EOU_THERAPY_FALLBACK_SLACK_MS", "1000"))
+
+# Speaking rate for paced breathing counts and for everything the
+# grounding coach says (ElevenLabs voice_settings.speed, 0.7-1.2). 1.0
+# turns the slowdown off. The coach's "tts_pacing: slow" marker cannot be
+# used for this: it comes at the end of a reply, after every sentence has
+# already been synthesized.
+TTS_SLOW_SPEED = float(os.environ.get("TTS_SLOW_SPEED", "0.85"))
+_SLOW_AGENTS = frozenset({"grounding_coach"})
+# Send `led_breath` control frames so NAO's eyes follow paced breathing.
+BREATH_LEDS = os.environ.get("BREATH_LEDS", "1") == "1"
+# Send `turn_state` control frames (listening / thinking / speaking) so
+# NAO's eyes show whose turn it is. Robot code that predates the frame logs
+# it as an unknown control and carries on.
+TURN_LEDS = os.environ.get("TURN_LEDS", "1") == "1"
+# How long after NAO speaks a turn-taking line (repair, idle check-in,
+# goodbye) a transcript matching it is treated as NAO hearing itself.
+TURN_LINE_ECHO_WINDOW_S = float(os.environ.get("TURN_LINE_ECHO_WINDOW_S", "15"))
 
 # Pre-roll window kept while no speech has been detected yet.
 #
@@ -1177,8 +1207,25 @@ async def _send_audio_chunk(ws: WebSocket, sess: "_Session",
     # Remember what NAO is saying so the mute matcher can tell the user's
     # voice from NAO's own, heard through the mic left open during TTS.
     sess.speaking_text = str(frame.get("text") or "")
+    # Eyes to "speaking" before the first chunk of a reply. Not for the
+    # forced crisis reply: it sets white eyes, which must stay.
+    if not force:
+        await _send_turn_state(ws, sess, "speaking")
     await _send_json(ws, frame)
     return True
+
+
+async def _send_turn_state(ws: WebSocket, sess: "_Session", state: str,
+                           **data: Any) -> None:
+    """Tell the robot whose turn it is: listening / thinking / speaking.
+
+    Drives NAO's eyes (cyan / blue pulse / yellow). Deduplicated per
+    session, so calling it on every audio chunk costs one compare.
+    """
+    if not TURN_LEDS or getattr(sess, "turn_led_state", None) == state:
+        return
+    sess.turn_led_state = state
+    await _send_json(ws, _control_frame("turn_state", state=state, **data))
 
 
 def _audio_chunk_frame(
@@ -1453,6 +1500,25 @@ class _Session:
         # Side-channel buffer for audio captured while NAO is speaking.
         # Never becomes a turn -- only checked for the mute keyword.
         "mute_buf", "_mute_check_running",
+        # Turn-taking feel (server/turn_taking.py). `repair_armed` drops to
+        # False after a "Sorry, I didn't catch that" and comes back on the
+        # next accepted turn, so NAO never asks twice in a row.
+        "repair_armed", "last_repair_ms",
+        # Wall-clock ms of the last inbound audio chunk (dropped or not) --
+        # tells the therapy EoU fallback whether the robot is still
+        # streaming -- and of the user's last speech onset.
+        "last_chunk_ms", "last_user_speech_ms",
+        # Idle check-in latch: once per silence period. `user_turns`
+        # counts accepted utterances on this connection -- the check-in
+        # only runs mid-conversation, never before anyone has spoken.
+        "idle_checkin_done", "user_turns",
+        # Last `turn_state` sent to the robot's eyes (dedups repeats).
+        "turn_led_state",
+        # Deferred-hint fallback task for therapy-lane turns.
+        "_eou_fallback_task",
+        # Turn-taking lines NAO said recently -> wall-clock ms, for the
+        # time-bounded echo guard.
+        "turn_lines_said",
     )
 
     def __init__(self, username: str) -> None:
@@ -1472,6 +1538,17 @@ class _Session:
         self.greeted: bool = False
         self.mute_buf = bytearray()
         self._mute_check_running: bool = False
+        self.repair_armed: bool = True
+        self.last_repair_ms: float = 0.0
+        self.last_chunk_ms: float = 0.0
+        # Starts at connect so the idle check-in counts from the moment the
+        # conversation opened, not from 1970.
+        self.last_user_speech_ms: float = time.time() * 1000.0
+        self.idle_checkin_done: bool = False
+        self.user_turns: int = 0
+        self.turn_led_state: str | None = None
+        self._eou_fallback_task: Any | None = None
+        self.turn_lines_said: dict[str, float] = {}
 
         # Phase 2: server-side streaming Silero (set lazily on first audio
         # chunk so a missing dependency at import time doesn't kill the
@@ -1644,25 +1721,36 @@ async def _should_finalize_turn(sess: _Session,
 
     silence_ms = _silero_silence_ms(sess)
     speaking = _silero_speaking(sess)
+    # Support conversations get more thinking time (THERAPY_EOU_SILENCE_MS):
+    # the robot's 300 ms energy hint and the semantic shortcut below may
+    # not end those turns early.
+    eou_ms = _eou_min_silence_ms(sess)
+    patient = eou_ms > EOU_MIN_SILENCE_MS
 
     # 1. Silero says we've been silent long enough on its own — but only
     #    after speech actually happened. A clip that is silence-from-the-
     #    start gets handled by the robot hint or the hard ceiling, not by
     #    the silence accumulator (otherwise we'd auto-finalize before the
     #    user has even started talking).
-    if sess.had_speech and silence_ms >= EOU_MIN_SILENCE_MS:
+    if sess.had_speech and silence_ms >= eou_ms:
         return True
 
     # 2. Robot also thinks we're done — only need a brief silero-confirmed
     #    silence window to commit. This branch fires regardless of
     #    `had_speech` because the robot's energy VAD already endpointed
-    #    the utterance — we trust it.
-    if sess.robot_eou_hint and (silence_ms >= EOU_HINT_CONFIRM_MS or not speaking):
-        return True
+    #    the utterance — we trust it. In a support conversation the hint
+    #    still needs the full therapy silence behind it.
+    if sess.robot_eou_hint:
+        if patient:
+            if silence_ms >= eou_ms and not speaking:
+                return True
+        elif silence_ms >= EOU_HINT_CONFIRM_MS or not speaking:
+            return True
 
     # 3. Semantic-early branch — only when we already have a transcript
     #    snapshot to inspect (cheap conditions warrant the LLM call).
     if (sess.had_speech
+            and not patient
             and transcript_so_far
             and silence_ms >= EOU_SEMANTIC_SILENCE_MS
             and not speaking
@@ -1705,6 +1793,302 @@ def _arm_post_tts_cooldown(sess: _Session) -> None:
 def _agent_turn_running(sess: _Session) -> bool:
     task = getattr(sess, "active_turn_task", None)
     return task is not None and not task.done()
+
+
+# ───────── turn-taking feel (repair / idle / goodbye / therapy EoU) ─────────
+
+def _support_lane(username: str) -> str | None:
+    """The active support lane for ``username``, without side effects.
+
+    ``conversation_state.state_for`` refreshes the anonymous history epoch
+    (and creates one), which is right for a turn but wrong for a check that
+    runs on every 20 ms audio chunk -- background noise would keep a dead
+    guest conversation alive. So this peeks: the named key never mints, and
+    for guests only an already-open epoch is read.
+    """
+    try:
+        from server import conversation_state as _cs
+        from server import session as _ses
+        if _ses.is_anonymous(username):
+            key = _ses.live_anonymous_key()
+        else:
+            key = _ses.session_key_for(username)
+        if not key:
+            return None
+        with _cs._lock:
+            state = _cs._states.get(key)
+        if not state:
+            return None
+        return _cs.active_lane(state)
+    except Exception:  # noqa: BLE001 -- never break turn-taking on this
+        return None
+
+
+def _tts_speed_for(paced: bool, active_agent: str | None) -> float | None:
+    """Speaking rate for one reply chunk, or None for the normal rate.
+
+    Paced breathing counts and the grounding coach are spoken a little
+    slower. None (not 1.0) for everything else, so ordinary replies send
+    exactly the request they always did.
+    """
+    if TTS_SLOW_SPEED == 1.0:
+        return None
+    if paced or (active_agent in _SLOW_AGENTS):
+        return TTS_SLOW_SPEED
+    return None
+
+
+def _eou_min_silence_ms(sess: "_Session") -> int:
+    return turn_taking.eou_silence_ms(
+        EOU_MIN_SILENCE_MS, _support_lane(sess.username))
+
+
+def _note_turn_line(sess: "_Session", text: str) -> None:
+    sess.turn_lines_said[text] = time.time() * 1000.0
+
+
+def _is_recent_turn_line_echo(sess: "_Session", transcript: str) -> bool:
+    """True when the transcript is a turn-taking line NAO said moments ago.
+
+    Time-bounded on purpose instead of joining `_system_spoken_lines`: the
+    repair line ("Sorry, I didn't catch that. Could you say it again?")
+    covers almost every word of a user asking NAO to repeat itself ("could
+    you say that again?"), and the stateless guard would drop that request
+    forever. Echo arrives within seconds, so only a recent line counts.
+    """
+    toks = set(_echo_tokens(transcript))
+    if len(toks) < 3:
+        return False
+    now_ms = time.time() * 1000.0
+    for line, said_ms in list(sess.turn_lines_said.items()):
+        if now_ms - said_ms > TURN_LINE_ECHO_WINDOW_S * 1000.0:
+            sess.turn_lines_said.pop(line, None)
+            continue
+        line_toks = set(_echo_tokens(line))
+        if line_toks and len(toks & line_toks) / float(len(toks)) >= _SYSTEM_LINE_OVERLAP:
+            return True
+    return False
+
+
+async def _speak_turn_line(ws: WebSocket, sess: "_Session", text: str,
+                           kind: str) -> bool:
+    """Say one short turn-taking line (repair / idle check-in / goodbye).
+
+    Follows the mute-ack pattern: never forced through mute, registered
+    with the echo guards, post-TTS cooldown armed, then `tts_ended` so the
+    robot's mic-resume waiter and turn LEDs run as after any reply.
+    """
+    if not text or not text.strip() or sess.muted:
+        return False
+    try:
+        mp3 = await asyncio.to_thread(
+            _synth_for, sess.username, text, sess.voice_profile_override)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_line_tts_failed", user=sess.username,
+                       kind=kind, error=repr(exc))
+        return False
+    if not mp3:
+        return False
+    _record_reply_chunk(sess.username, text)
+    _note_turn_line(sess, text)
+    # A greeting or earlier line may have left the dedup on "speaking"
+    # without a "listening" in between; make sure this line lights up.
+    sess.turn_led_state = None
+    sent = await _send_audio_chunk(
+        ws, sess, _audio_chunk_frame(sess.next_seq(), text, mp3))
+    if sent:
+        legacy.LAST_REPLY[sess.username] = text
+        _arm_post_tts_cooldown(sess)
+        await _send_json(ws, _control_frame("tts_ended", sentences=1))
+        await _send_turn_state(ws, sess, "listening")
+        logger.info("turn_line_spoken", user=sess.username,
+                    session_id=sess.session_id, kind=kind, text=text)
+    return sent
+
+
+# Last repair per user, across WS reconnects: the robot reconnects every
+# few seconds during long TTS, and a per-connection clock alone would let
+# each fresh connection ask again.
+_LAST_REPAIR_MS: dict[str, float] = {}
+_LAST_REPAIR_LINE: dict[str, str] = {}
+
+
+async def _maybe_speak_repair(ws: WebSocket, sess: "_Session",
+                              reason: str | None, clip_ms: float,
+                              speech_confirmed: bool | None = None) -> bool:
+    """After a rejected turn, ask the user to repeat -- sparingly.
+
+    The WS only exists while the robot is ENGAGED (main.py opens it on
+    wake and closes it on disengage), so an open session is the
+    engagement check.
+    """
+    now_ms = time.time() * 1000.0
+    last = max(sess.last_repair_ms, _LAST_REPAIR_MS.get(sess.username, 0.0))
+    nao_speaking = (now_ms < sess.tts_active_until_ms
+                    or _agent_turn_running(sess))
+    if not turn_taking.repair_allowed(
+            reason=reason, clip_ms=clip_ms, muted=sess.muted, engaged=True,
+            armed=sess.repair_armed, last_repair_ms=last, now_ms=now_ms,
+            nao_speaking=nao_speaking, speech_confirmed=speech_confirmed):
+        return False
+    sess.repair_armed = False
+    sess.last_repair_ms = now_ms
+    _LAST_REPAIR_MS[sess.username] = now_ms
+    line = turn_taking.pick_repair_line(_LAST_REPAIR_LINE.get(sess.username))
+    _LAST_REPAIR_LINE[sess.username] = line
+    return await _speak_turn_line(ws, sess, line, "repair")
+
+
+def _mark_turn_accepted(sess: "_Session") -> None:
+    """A real utterance got through: re-arm repair, restart the idle clock."""
+    sess.repair_armed = True
+    sess.idle_checkin_done = False
+    sess.user_turns += 1
+    sess.last_user_speech_ms = time.time() * 1000.0
+
+
+def _claim_idle_checkin(sess: "_Session") -> bool:
+    """Whether the idle check-in is due now; latches it if so.
+
+    Synchronous on purpose: the caller runs on every inbound audio chunk,
+    and claiming before any await means two chunks can never both start
+    a check-in.
+    """
+    if sess.user_turns <= 0:
+        return False  # nobody has spoken yet: not mid-conversation
+    now_ms = time.time() * 1000.0
+    last = max(sess.last_user_speech_ms, sess.tts_active_until_ms)
+    if not turn_taking.idle_checkin_due(
+            now_ms=now_ms, last_activity_ms=last, muted=sess.muted,
+            already_done=sess.idle_checkin_done,
+            busy=(sess.had_speech or sess._finalize_in_flight
+                  or _agent_turn_running(sess))):
+        return False
+    sess.idle_checkin_done = True
+    return True
+
+
+async def _maybe_idle_checkin(ws: WebSocket, sess: "_Session") -> bool:
+    """Say "I'm still here whenever you're ready." once per long silence.
+
+    Called from the audio path only when nothing else is going on (the
+    caller has already dropped frames during TTS / a running turn). Never
+    changes posture -- the check-in is spoken only.
+    """
+    if not _claim_idle_checkin(sess):
+        return False
+    return await _speak_turn_line(
+        ws, sess, turn_taking.IDLE_CHECKIN_LINE, "idle_checkin")
+
+
+async def _emit_goodbye(ws: WebSocket, sess: "_Session", transcript: str,
+                        phase_ms: dict[str, float]) -> None:
+    """Close the conversation warmly without disengaging the robot.
+
+    The robot stays ENGAGED -- its wake state machine ends the session the
+    usual way when the person walks off -- so the next wake works exactly
+    as before, and nothing here touches posture. Only the conversation's
+    working state is closed: the support lane is left, the recap is
+    finalised (when the CBT side provides `finalize_session_recap`), the
+    per-conversation state is cleared, and an anonymous history epoch is
+    retired so the next stranger does not inherit this conversation.
+    """
+    sess.turn_idx += 1
+    await _send_json(ws, _control_frame(
+        "transcript", transcript=transcript,
+        stt_ms=phase_ms.get("stt", 0)))
+    lane = _support_lane(sess.username)
+    await _speak_turn_line(ws, sess, turn_taking.goodbye_reply(lane),
+                           "goodbye")
+    await _send_json(ws, _control_frame("conversation_closed",
+                                        reason="goodbye"))
+    logger.info(
+        "turn_complete",
+        user=sess.username, session_id=sess.session_id,
+        turn_idx=sess.turn_idx, phase_ms=phase_ms,
+        transcript=transcript[:200], outcome="goodbye",
+        support_lane=lane,
+    )
+    # The recap is an LLM call; run the close in the background so the
+    # receive loop keeps draining frames meanwhile.
+    task = asyncio.create_task(_close_conversation(sess.username, lane))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+async def _close_conversation(username: str, lane: str | None) -> str:
+    """Finalize the recap (support conversations only), then forget the
+    conversation. Returns the recap status, for the log and tests."""
+    recap_status = "skipped"
+    if lane:
+        fn = getattr(_emotion_module, "finalize_session_recap", None)
+        if fn is None:
+            recap_status = "unavailable"
+        else:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(fn, username), timeout=30.0)
+                recap_status = "ok"
+            except Exception as exc:  # noqa: BLE001 -- the goodbye already landed
+                recap_status = "failed"
+                logger.warning("goodbye_recap_failed", user=username,
+                               error=repr(exc))
+    try:
+        from server import conversation_state as _cs
+        from server import session as _ses
+        _cs.clear(username)
+        if _ses.is_anonymous(username):
+            _ses.retire_anonymous_epoch()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("goodbye_state_clear_failed", user=username,
+                       error=repr(exc))
+    logger.info("conversation_closed", user=username, support_lane=lane,
+                recap=recap_status)
+    return recap_status
+
+
+async def _with_listening_after(ws: WebSocket, sess: "_Session",
+                                coro: Any) -> None:
+    """Run a reply coroutine, then hand the eyes back to "listening".
+
+    The robot applies it once its speaker has drained, so sending it as
+    soon as the server finishes is correct.
+    """
+    try:
+        await coro
+    finally:
+        try:
+            await _send_turn_state(ws, sess, "listening")
+        except Exception:  # noqa: BLE001 -- socket gone; nothing to light
+            pass
+
+
+async def _therapy_eou_fallback(ws: WebSocket, sess: "_Session",
+                                delay_s: float) -> None:
+    """Force a deferred therapy turn if the robot stopped streaming audio.
+
+    Normally the arbiter finalizes on the next chunks once silence reaches
+    `THERAPY_EOU_SILENCE_MS`. This only matters when no chunks arrive.
+    """
+    try:
+        await asyncio.sleep(delay_s)
+        if not sess.audio_buf or not sess.robot_eou_hint:
+            return  # already finalized (reset_turn clears the hint)
+        if (time.time() * 1000.0) - sess.last_chunk_ms < 400.0:
+            return  # audio still flowing; the arbiter will decide
+        if _silero_speaking(sess):
+            return
+        logger.info("eou_therapy_fallback_forced", user=sess.username,
+                    session_id=sess.session_id)
+        await _finalize_turn_if_ready(ws, sess, force=True)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("eou_therapy_fallback_failed", user=sess.username,
+                       error=repr(exc))
 
 
 async def _emit_crisis(ws: WebSocket, sess: _Session, transcript: str,
@@ -2659,16 +3043,19 @@ async def _emit_agent_turn(ws: WebSocket, sess: _Session,
             if _dedup_key:
                 _sentences_seen_this_turn.add(_dedup_key)
             paced_chunks = breathing_pacing.expand_tts_pacing(sentence)
-            if len(paced_chunks) > 1 or (
-                paced_chunks and paced_chunks[0][1] > 0
-            ):
+            paced = breathing_pacing.is_paced(paced_chunks)
+            breath_cues = (breathing_pacing.breath_phase_cues(paced_chunks)
+                           if (paced and BREATH_LEDS)
+                           else [None] * len(paced_chunks))
+            if paced:
                 logger.info(
                     "tts_breath_pacing_expanded",
                     user=sess.username, session_id=sess.session_id,
                     chunks=len(paced_chunks),
                     sentence_preview=sentence[:100],
                 )
-            for tts_text, pause_after_ms in paced_chunks:
+            for (tts_text, pause_after_ms), breath_cue in zip(
+                    paced_chunks, breath_cues):
                 # Barge guard between chunks.
                 if sess.barge_event.is_set():
                     barged = True
@@ -2687,9 +3074,15 @@ async def _emit_agent_turn(ws: WebSocket, sess: _Session,
                     ))
                     handoff_sent_for = final_reply["active_agent"]
                 t_synth = time.perf_counter()
-                mp3 = await asyncio.to_thread(
-                    _synth_for, sess.username, tts_text,
-                    sess.voice_profile_override)
+                speed = _tts_speed_for(paced, final_reply["active_agent"])
+                if speed is not None:
+                    mp3 = await asyncio.to_thread(
+                        _synth_for, sess.username, tts_text,
+                        sess.voice_profile_override, speed)
+                else:
+                    mp3 = await asyncio.to_thread(
+                        _synth_for, sess.username, tts_text,
+                        sess.voice_profile_override)
                 # Re-check after synth — barge_in can arrive during the
                 # synthesize call (which can take hundreds of ms). Dropping
                 # the freshly-synthesized chunk here keeps us within the
@@ -2719,9 +3112,16 @@ async def _emit_agent_turn(ws: WebSocket, sess: _Session,
                         "tts_chunk_skipped", text=tts_text,
                     ))
                     continue
+                chunk_seq = sess.next_seq()
+                if breath_cue and not sess.muted:
+                    # Bound to the chunk by seq: the robot starts the eye
+                    # fade when that chunk starts playing, not on receipt
+                    # (earlier chunks may still be queued ahead of it).
+                    await _send_json(ws, _control_frame(
+                        "led_breath", seq=chunk_seq, **breath_cue))
                 await _send_audio_chunk(
                     ws, sess, _audio_chunk_frame(
-                        sess.next_seq(), tts_text, mp3,
+                        chunk_seq, tts_text, mp3,
                         pause_after_ms=pause_after_ms,
                     ),
                 )
@@ -2831,6 +3231,8 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     turn_silero_available = sess.silero is not None
     turn_had_speech = bool(sess.had_speech)
     pcm = bytes(sess.audio_buf)
+    clip_ms = len(pcm) / float(_WS_AUDIO_SR * _WS_AUDIO_BYTES_PER_FRAME / 1000.0)
+    speech_confirmed = turn_had_speech if turn_silero_available else None
     image_b64 = sess.image_b64
     sess.reset_turn()
 
@@ -2867,6 +3269,8 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
                 await _send_json(ws, _control_frame(
                     "transcript", transcript="", reject_reason="no_voice",
                 ))
+                await _maybe_speak_repair(ws, sess, "no_voice", clip_ms,
+                                          speech_confirmed)
                 return
 
         # Phase 11.10 — prefer the streaming STT's final transcript when
@@ -2943,6 +3347,8 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
             transcript=transcript,
             reject_reason="silero_no_speech",
         ))
+        await _maybe_speak_repair(ws, sess, "silero_no_speech", clip_ms,
+                                  speech_confirmed)
         return
 
     # Phase 11 / Option B: kick off the vision call IN PARALLEL with the
@@ -3020,11 +3426,14 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
         await _send_json(ws, _control_frame(
             "transcript", transcript=transcript, reject_reason=reason,
         ))
+        await _maybe_speak_repair(ws, sess, reason, clip_ms, speech_confirmed)
         return
 
     # Stateless self-echo check: runs for every turn, including while
     # `asking_name` is set and regardless of whose session this is.
-    if _is_system_line_echo(transcript):
+    # The time-bounded check covers the repair / check-in / goodbye lines.
+    if (_is_system_line_echo(transcript)
+            or _is_recent_turn_line_echo(sess, transcript)):
         logger.info(
             "turn_rejected",
             user=sess.username, session_id=sess.session_id,
@@ -3084,6 +3493,7 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     if crisis.positive:
         legacy.consume_partial(sess.username, transcript)
         _after_crisis(sess, conv, crisis)
+        _mark_turn_accepted(sess)
         await _emit_crisis(ws, sess, transcript, phase_ms)
         return
     safety.remember_turn(conv, transcript)
@@ -3094,6 +3504,24 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
         legacy.consume_partial(sess.username, transcript)
         _cancel_pending_vision(sess)
         await _emit_forget(ws, sess, forget, phase_ms)
+        return
+
+    # Real speech got through every guard: re-arm the repair line and
+    # restart the idle clock.
+    _mark_turn_accepted(sess)
+
+    # A clear goodbye closes the conversation warmly. After the crisis
+    # gate on purpose, so nothing alarming is ever answered with "bye".
+    # Inside the support lane the first goodbye goes to the therapist, who
+    # closes the visit (summary + optional homework, agents._resume_lane);
+    # only a goodbye after that close, or outside the lane, is answered here.
+    if (turn_taking.GOODBYE_ENABLED and turn_taking.is_goodbye(transcript)
+            and not (_support_lane(sess.username)
+                     and not conv.get("therapy_closing"))):
+        _cancel_pending_vision(sess)
+        legacy.consume_partial(sess.username, transcript)
+        sess.asking_name = False
+        await _emit_goodbye(ws, sess, transcript, phase_ms)
         return
 
     if sess.asking_name:
@@ -3174,6 +3602,9 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
     # Stitch any buffered partial onto the current transcript.
     transcript = legacy.consume_partial(sess.username, transcript)
 
+    # Eyes: NAO has the words and is working out a reply.
+    await _send_turn_state(ws, sess, "thinking")
+
     # Motion-trigger short-circuit — bypass the LLM for clear body commands.
     with _phase("motion_trigger", phase_ms):
         motion = motion_trigger.detect(transcript)
@@ -3181,7 +3612,10 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
         # Cancel the parallel vision call — motion path doesn't use it
         # and we shouldn't burn an API call we won't read.
         _cancel_pending_vision(sess)
-        await _emit_motion(ws, sess, transcript, motion, phase_ms)
+        try:
+            await _emit_motion(ws, sess, transcript, motion, phase_ms)
+        finally:
+            await _send_turn_state(ws, sess, "listening")
         return
 
     # Phase 10.5: spawn the agent turn as a background task so the WS
@@ -3203,7 +3637,7 @@ async def _process_turn(ws: WebSocket, sess: _Session) -> None:
         turn_coro = _emit_agent_turn(
             ws, sess, transcript, image_b64, phase_ms, t_user_done,
         )
-    task = asyncio.create_task(turn_coro)
+    task = asyncio.create_task(_with_listening_after(ws, sess, turn_coro))
     sess.active_turn_task = task
 
     def _clear_active_turn(done_task: asyncio.Task) -> None:
@@ -3284,6 +3718,7 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
         # could echo back through STT and trigger a self-conversation
         # loop.
         now_ms = time.time() * 1000.0
+        sess.last_chunk_ms = now_ms
         in_tts_window = now_ms < sess.tts_active_until_ms
         turn_running = _agent_turn_running(sess)
         # The robot tells us whether its own speaker was live when this audio
@@ -3402,6 +3837,15 @@ async def _ingest_frame(ws: WebSocket, sess: _Session,
         # trimming would eat the whole turn.
         if sess.silero is not None and not sess.had_speech:
             _trim_preroll(sess.audio_buf)
+
+        # Long quiet spell mid-conversation: one gentle check-in. Spoken
+        # from a task so synthesis never stalls the receive loop; the
+        # claim is taken synchronously so it cannot fire twice.
+        if not sess.had_speech and _claim_idle_checkin(sess):
+            task = asyncio.create_task(_speak_turn_line(
+                ws, sess, turn_taking.IDLE_CHECKIN_LINE, "idle_checkin"))
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
 
         # Arbiter check — may finalize the turn right here.
         await _finalize_turn_if_ready(ws, sess)
@@ -4091,6 +4535,22 @@ async def _ingest_control(ws: WebSocket, sess: _Session,
         # force the legacy behavior (Phase 1 contract: EoU control
         # finalizes the turn).
         finalized = await _finalize_turn_if_ready(ws, sess)
+        if not finalized and sess.silero is not None and not sess.asking_name:
+            # Support conversation: don't force on the robot's quick hint;
+            # the arbiter finalizes on the next chunks once the therapy
+            # silence has passed. The fallback covers a robot that stops
+            # streaming after its hint.
+            eou_ms = _eou_min_silence_ms(sess)
+            if eou_ms > EOU_MIN_SILENCE_MS:
+                prev = sess._eou_fallback_task
+                if prev is not None and not prev.done():
+                    prev.cancel()
+                delay_s = (eou_ms + EOU_THERAPY_FALLBACK_SLACK_MS) / 1000.0
+                sess._eou_fallback_task = asyncio.create_task(
+                    _therapy_eou_fallback(ws, sess, delay_s))
+                logger.info("eou_therapy_deferred", user=sess.username,
+                            session_id=sess.session_id, eou_ms=eou_ms)
+                return True
         if not finalized:
             await _finalize_turn_if_ready(ws, sess, force=True)
         sess.asking_name = False

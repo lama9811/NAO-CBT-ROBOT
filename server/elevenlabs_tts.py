@@ -143,13 +143,31 @@ def _voice_id_for(profile: str) -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Speaking rate
+# ──────────────────────────────────────────────────────────────────────────
+# ElevenLabs accepts voice_settings.speed in [0.7, 1.2]. Used for the
+# grounding coach's "tts_pacing: slow" and for paced breathing counts.
+SPEED_MIN = 0.7
+SPEED_MAX = 1.2
+
+
+def clamp_speed(speed: float) -> float:
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        return 1.0
+    return max(SPEED_MIN, min(SPEED_MAX, value))
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Sync entry point — drop-in for openai_tts.synthesize
 # ──────────────────────────────────────────────────────────────────────────
 
 
 def synthesize(text: str,
                voice_id: str | None = None,
-               output_format: str | None = None) -> bytes | None:
+               output_format: str | None = None,
+               speed: float | None = None) -> bytes | None:
     """Synthesize the entire sentence and return all audio bytes.
 
     Drop-in replacement for ``openai_tts.synthesize``. Internally opens
@@ -157,6 +175,10 @@ def synthesize(text: str,
     'isFinal' event lands, returns the concatenation.
 
     Returns None on any failure so the caller can fall back to OpenAI.
+
+    ``speed`` sets ElevenLabs' ``voice_settings.speed`` (0.7-1.2, 1.0 is
+    normal). ``None`` leaves it out of the request entirely, so ordinary
+    replies are byte-for-byte the same request as before.
     """
     if not text or not str(text).strip():
         return None
@@ -174,7 +196,8 @@ def synthesize(text: str,
         chunks: list[bytes] = []
         try:
             async for chunk in synthesize_stream(text, voice_id=voice_id,
-                                                   output_format=output_format):
+                                                   output_format=output_format,
+                                                   speed=speed):
                 chunks.append(chunk)
         except Exception as e:  # noqa: BLE001
             _log.warning("elevenlabs synthesize failed: %r", e)
@@ -207,6 +230,7 @@ def synthesize(text: str,
 async def synthesize_stream(text: str,
                               voice_id: str | None = None,
                               output_format: str | None = None,
+                              speed: float | None = None,
                               ) -> AsyncIterator[bytes]:
     """Yield raw audio chunks as they arrive from ElevenLabs.
 
@@ -256,15 +280,19 @@ async def synthesize_stream(text: str,
         _log.warning("elevenlabs WS connect failed: %r", e)
         return
 
+    voice_settings = {
+        "stability": 0.5,
+        "similarity_boost": 0.8,
+        "use_speaker_boost": True,
+    }
+    if speed is not None:
+        voice_settings["speed"] = clamp_speed(speed)
+
     try:
         # Init frame.
         await ws.send(json.dumps({
             "text": " ",
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.8,
-                "use_speaker_boost": True,
-            },
+            "voice_settings": voice_settings,
             "generation_config": {
                 # Heuristic-driven sentence chunking on ElevenLabs side.
                 # We already send sentence-sized payloads, but this
